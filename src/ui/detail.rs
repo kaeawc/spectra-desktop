@@ -35,7 +35,44 @@ pub fn detail(s: &App, j: &Jvm, k: &Kit) -> El {
         .child(args(s, j, k))
 }
 
-fn section(title: &str, body: El, k: &Kit) -> El {
+/// The JVM's part of a process page: what runs in it, its numbers, how they moved and its
+/// arguments. The page above shows the findings.
+pub fn jvm_part(s: &App, j: &Jvm, k: &Kit) -> El {
+    let history = s.history(j.pid);
+    col()
+        .key("jd-detail")
+        .w_full()
+        .gap(16.0)
+        .child(
+            col()
+                .gap(2.0)
+                .child(text("Java").font(k.ty.body_medium).color(k.c.text_base))
+                .child(
+                    text(format!("{} · {}", j.main_class, jdk(j)))
+                        .key("jd-meta")
+                        .font(k.ty.small)
+                        .color(k.c.text_muted)
+                        .wrap(),
+                ),
+        )
+        .child(tiles(s, j, k))
+        .child(section(
+            "JVM timeline",
+            timeline(&history, s.baseline_index(j.pid), k.c.text_accent, k),
+            k,
+        ))
+        .child(args(s, j, k))
+}
+
+fn jdk(j: &Jvm) -> String {
+    match (j.jdk_vendor.is_empty(), j.jdk_version.is_empty()) {
+        (_, true) => "JDK unknown".to_owned(),
+        (true, false) => format!("JDK {}", j.jdk_version),
+        (false, false) => format!("{} {}", j.jdk_vendor, j.jdk_version),
+    }
+}
+
+pub fn section(title: &str, body: El, k: &Kit) -> El {
     col()
         .w_full()
         .gap(10.0)
@@ -52,11 +89,7 @@ fn header(s: &App, j: &Jvm, k: &Kit) -> El {
     let worst = s.findings_for(j.pid).into_iter().next();
     let severity = worst.as_ref().map_or(Severity::Healthy, |f| f.severity);
     let verdict = worst.map_or_else(|| "Healthy".to_owned(), |f| f.title);
-    let jdk = match (j.jdk_vendor.is_empty(), j.jdk_version.is_empty()) {
-        (_, true) => "JDK unknown".to_owned(),
-        (true, false) => format!("JDK {}", j.jdk_version),
-        (false, false) => format!("{} {}", j.jdk_vendor, j.jdk_version),
-    };
+    let jdk = jdk(j);
     col()
         .key("jd-header")
         .w_full()

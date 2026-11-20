@@ -1,9 +1,14 @@
 //! Headless runs of the real view: press what a person would press, then look for keyed elements.
 
-use rune::{Env, Runtime};
+use rune::{Env, Runtime, TextEdit};
 
-use crate::app::{App, init, sample_scene};
+use crate::app::{App, init};
 use crate::data::{Gc, Jvm};
+use crate::groups::{Category, Nav};
+use crate::procs::Role;
+use crate::sample::{detail_scene, old_scene, sample_scene};
+
+const SLACK: &str = "g:app::Applications:Slack.app";
 
 fn runtime(state: App) -> Runtime<App> {
     let env = Env {
@@ -15,10 +20,14 @@ fn runtime(state: App) -> Runtime<App> {
     rt
 }
 
-fn sample() -> Runtime<App> {
+fn scene(f: fn(&mut App)) -> Runtime<App> {
     let mut s = init();
-    sample_scene(&mut s);
+    f(&mut s);
     runtime(s)
+}
+
+fn sample() -> Runtime<App> {
+    scene(sample_scene)
 }
 
 fn settle(rt: &mut Runtime<App>) {
@@ -27,7 +36,11 @@ fn settle(rt: &mut Runtime<App>) {
     }
 }
 
+/// Scrolls `key` into view, then presses it.
 fn press(rt: &mut Runtime<App>, key: &str) {
+    let k = key.to_owned();
+    rt.update(move |_, tx| tx.scroll_into_view(k));
+    settle(rt);
     let (x, y) = rt
         .find(key)
         .unwrap_or_else(|| panic!("nothing keyed {key} on screen"));
@@ -44,9 +57,107 @@ fn text_of(rt: &Runtime<App>, key: &str) -> Option<String> {
 }
 
 #[test]
-fn a_sidebar_jvm_opens_its_page_and_all_jvms_goes_home() {
+fn the_overview_leads_with_a_summary_and_findings() {
+    let rt = sample();
+    for key in ["summary-procs", "summary-cpu", "summary-memory", "findings-title"] {
+        assert!(rt.find(key).is_some(), "the overview shows {key}");
+    }
+    assert_eq!(text_of(&rt, "summary-procs-value").as_deref(), Some("49"));
+    assert!(rt.find("subject-941-proc-invalid-signature").is_some());
+    assert!(rt.find("too-old").is_none());
+}
+
+#[test]
+fn a_sidebar_category_filters_the_list() {
     let mut rt = sample();
-    assert!(rt.find("jd-detail").is_none(), "the home lists findings");
+    press(&mut rt, "cat-apps");
+    assert_eq!(rt.state.nav, Nav::Category(Category::Apps));
+    assert!(rt.find("procs").is_some(), "the list shows");
+    assert!(rt.find(SLACK).is_some(), "Slack is an app");
+    assert!(rt.find("p:1340").is_none(), "python3 is not");
+    let s = &rt.state;
+    let pids: Vec<u32> = s.groups.iter().flat_map(|g| g.pids.iter().copied()).collect();
+    assert!(!pids.is_empty());
+    assert!(
+        pids.iter()
+            .all(|pid| matches!(s.process(*pid).unwrap().role, Role::App | Role::AppHelper))
+    );
+
+    press(&mut rt, "rt-jvm");
+    assert_eq!(rt.state.nav, Nav::Runtime(crate::procs::Runtime::Jvm));
+    assert_eq!(rt.state.groups.len(), 1, "the three JVMs, as one java group");
+    assert_eq!(rt.state.groups[0].pids.len(), 3);
+}
+
+#[test]
+fn a_group_opens_onto_its_processes() {
+    let mut rt = sample();
+    press(&mut rt, "all");
+    assert!(rt.find("p:901").is_none(), "closed");
+    press(&mut rt, SLACK);
+    assert!(rt.state.open_groups.contains("app::Applications:Slack.app"));
+    assert!(rt.find("p:901").is_some(), "its helper is listed under it");
+    assert_eq!(rt.state.selected, None, "opening a group opens no page");
+    press(&mut rt, SLACK);
+    assert!(rt.find("p:901").is_none());
+}
+
+#[test]
+fn clicking_a_row_opens_its_page_and_back_returns() {
+    let mut rt = sample();
+    press(&mut rt, "all");
+    press(&mut rt, "p:1300");
+    assert_eq!(rt.state.selected, Some(1300));
+    for key in [
+        "pd-header",
+        "pd-facts",
+        "pd-lane-cpu",
+        "pd-lane-mem",
+        "pd-cmd",
+        "pd-evidence",
+    ] {
+        assert!(rt.find(key).is_some(), "the page shows {key}");
+    }
+    assert_eq!(text_of(&rt, "pd-name").as_deref(), Some("rust-analyzer"));
+    assert_eq!(
+        text_of(&rt, "pd-verdict").as_deref(),
+        Some("Busy: 138.8% CPU for the last 8 readings")
+    );
+    press(&mut rt, "back");
+    assert_eq!(rt.state.selected, None);
+    assert_eq!(rt.state.nav, Nav::All, "back where it was");
+}
+
+#[test]
+fn the_parent_link_opens_the_parent() {
+    let mut rt = sample();
+    press(&mut rt, "all");
+    press(&mut rt, "p:1300");
+    assert_eq!(
+        text_of(&rt, "pd-parent").as_deref(),
+        Some("Code Helper (Plugin) · 921")
+    );
+    press(&mut rt, "pd-parent");
+    assert_eq!(rt.state.selected, Some(921));
+    assert_eq!(text_of(&rt, "pd-name").as_deref(), Some("Code Helper (Plugin)"));
+    assert!(
+        rt.find("pd-child-1300").is_some(),
+        "and lists what it started"
+    );
+    press(&mut rt, "pd-child-1310");
+    assert_eq!(rt.state.selected, Some(1310));
+}
+
+#[test]
+fn a_spectra_too_old_to_classify_says_so_and_jvms_still_work() {
+    let mut rt = scene(old_scene);
+    assert!(rt.find("too-old").is_some());
+    assert_eq!(
+        text_of(&rt, "too-old-title").as_deref(),
+        Some("Spectra is too old to list every process")
+    );
+    assert!(rt.find("all").is_none(), "no process list to offer");
+    assert!(rt.find("subject-4102-jvm-heap-pressure").is_some());
     press(&mut rt, "jvm-4101");
     assert_eq!(rt.state.selected, Some(4101));
     for key in [
@@ -59,7 +170,7 @@ fn a_sidebar_jvm_opens_its_page_and_all_jvms_goes_home() {
         "jd-lane-threads",
         "jd-args",
     ] {
-        assert!(rt.find(key).is_some(), "the detail page shows {key}");
+        assert!(rt.find(key).is_some(), "the JVM page shows {key}");
     }
     assert_eq!(
         text_of(&rt, "jd-verdict").as_deref(),
@@ -70,23 +181,27 @@ fn a_sidebar_jvm_opens_its_page_and_all_jvms_goes_home() {
         rt.find("jd-tile-heap-since").is_some(),
         "a pinned baseline shows deltas"
     );
-    assert!(
-        rt.find("subject-4101-jvm-heap-pressure").is_some(),
-        "and that JVM's findings"
-    );
-    assert!(
-        rt.find("subject-4102-jvm-heap-pressure").is_none(),
-        "but no other JVM's"
-    );
-
-    press(&mut rt, "all");
+    assert!(rt.find("subject-4101-jvm-heap-pressure").is_some());
+    assert!(rt.find("subject-4102-jvm-heap-pressure").is_none());
+    press(&mut rt, "overview");
     assert_eq!(rt.state.selected, None);
     assert!(rt.find("jd-detail").is_none());
-    assert!(rt.find("subject-4102-jvm-heap-pressure").is_some());
 }
 
 #[test]
-fn a_cards_subject_opens_its_jvm_without_toggling_the_card() {
+fn a_jvms_process_page_holds_its_jvm_numbers() {
+    let rt = scene(detail_scene);
+    assert_eq!(text_of(&rt, "pd-name").as_deref(), Some("Server"), "named for what it runs");
+    assert_eq!(text_of(&rt, "pd-verdict").as_deref(), Some("Heap 83% full"));
+    for key in ["jd-detail", "jd-tile-heap", "jd-lane-heap", "jd-args", "pd-lane-cpu"] {
+        assert!(rt.find(key).is_some(), "the page shows {key}");
+    }
+    assert!(rt.find("subject-4101-jvm-heap-pressure").is_some());
+    assert!(rt.find("subject-4102-jvm-heap-pressure").is_none());
+}
+
+#[test]
+fn a_cards_subject_opens_its_process_without_toggling_the_card() {
     let mut rt = sample();
     let expanded = rt.state.expanded.clone();
     assert!(expanded.is_some());
@@ -97,12 +212,44 @@ fn a_cards_subject_opens_its_jvm_without_toggling_the_card() {
 }
 
 #[test]
-fn the_arguments_open_one_flag_per_line() {
+fn the_unsigned_finding_lists_those_processes() {
     let mut rt = sample();
-    press(&mut rt, "jvm-4101");
-    assert!(rt.find("jd-arg-0").is_none(), "collapsed by default");
-    rt.update(|_, tx| tx.scroll_into_view("jd-args"));
+    press(&mut rt, "subject-0-proc-unidentified");
+    assert_eq!(rt.state.nav, Nav::Unidentified);
+    let s = &rt.state;
+    assert!(
+        s.groups
+            .iter()
+            .flat_map(|g| &g.pids)
+            .all(|pid| s.process(*pid).unwrap().sign_status().is_unidentified())
+    );
+    assert!(rt.find("p:1340").is_some(), "python3 is unsigned");
+}
+
+#[test]
+fn a_search_narrows_the_list() {
+    let mut rt = sample();
+    press(&mut rt, "all");
+    rt.update(|s, _| {
+        s.query = TextEdit::new("slack");
+        s.rebuild();
+    });
     settle(&mut rt);
+    assert_eq!(rt.state.groups.len(), 1);
+    assert!(rt.find(SLACK).is_some());
+    assert!(rt.find("p:1300").is_none());
+    rt.update(|s, _| {
+        s.query = TextEdit::new("4101");
+        s.rebuild();
+    });
+    settle(&mut rt);
+    assert!(rt.find("p:4101").is_some(), "a lone match shows as its process");
+}
+
+#[test]
+fn the_arguments_open_one_flag_per_line() {
+    let mut rt = scene(detail_scene);
+    assert!(rt.find("jd-arg-0").is_none(), "collapsed by default");
     press(&mut rt, "jd-args/trigger");
     assert!(rt.state.args_open);
     let flags: Vec<Option<String>> = (0..4)
@@ -115,8 +262,6 @@ fn the_arguments_open_one_flag_per_line() {
         "-Dspring.profiles.active=prod",
     ];
     assert_eq!(flags, want.map(|s| Some(s.to_owned())));
-    rt.update(|_, tx| tx.scroll_into_view("jd-args"));
-    settle(&mut rt);
     press(&mut rt, "jd-args/trigger");
     assert!(!rt.state.args_open);
     assert!(rt.find("jd-arg-0").is_none());
