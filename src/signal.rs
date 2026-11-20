@@ -280,6 +280,12 @@ fn failure(what: &str, e: RunError) -> String {
     }
 }
 
+/// `kill` reads its pid into a signed `pid_t`, where 0 means "my process group" and anything that
+/// wraps negative means "every process I may signal", so only 2..=i32::MAX may reach it.
+fn signalable(pid: u32) -> bool {
+    pid > 1 && i32::try_from(pid).is_ok()
+}
+
 impl Signals for System {
     fn identify(&self, pid: u32) -> Result<Option<Identity>, String> {
         let mut cmd = Command::new("/bin/ps");
@@ -289,7 +295,7 @@ impl Signals for System {
         let stdout = String::from_utf8_lossy(&out.stdout);
         let Some(line) = stdout.lines().find(|l| !l.trim().is_empty()) else {
             // `ps -p` prints nothing and exits 1 for a pid nobody has.
-            return if out.status.code() == Some(1) {
+            return if out.status.code() == Some(1) && out.stderr.iter().all(u8::is_ascii_whitespace) {
                 Ok(None)
             } else {
                 Err(format!("ps failed: {}", String::from_utf8_lossy(&out.stderr).trim()))
@@ -299,6 +305,9 @@ impl Signals for System {
     }
 
     fn send(&self, pid: u32, signal: Signal) -> Result<(), String> {
+        if !signalable(pid) {
+            return Err(format!("refused to signal pid {pid}"));
+        }
         let mut cmd = Command::new("/bin/kill");
         cmd.args([signal.flag(), &pid.to_string()]);
         let out = run::run(cmd, DEADLINE, MAX_OUTPUT).map_err(|e| failure("kill", e))?;
@@ -316,6 +325,15 @@ impl Signals for System {
 pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn only_ordinary_pids_can_reach_kill() {
+        for pid in [0, 1, 2_147_483_648, u32::MAX] {
+            assert!(!signalable(pid), "{pid}");
+            assert!(System.send(pid, Signal::Term).is_err(), "{pid}");
+        }
+        assert!(signalable(2) && signalable(i32::MAX as u32));
+    }
     use std::rc::Rc;
 
     /// Answers `identify` from a table and records every signal instead of sending it.
