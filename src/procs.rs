@@ -510,7 +510,7 @@ mod tests {
     use super::*;
 
     /// One entry as the real feed prints it, extra fields and all.
-    const REAL: &str = r#"[{"pid":1836,"ppid":97562,"uid":501,"user":"jason","command":"qemu-system-aarch64-headless",
+    const REAL: &str = r#"[{"pid":1836,"ppid":97562,"uid":501,"user":"user","command":"qemu-system-aarch64-headless",
         "bsd_name":"qemu-system-aarch64-headless","executable_path":"/Users/x/qemu-system-aarch64-headless",
         "full_command_line":"/Users/x/qemu-system-aarch64-headless -avd fold -no-window","rss_kib":8622592,
         "vsize_kib":441676384,"vsz_bytes":452276617216,"thread_count":162,"cpu_pct":211.6,"cpu_percent":211.6,

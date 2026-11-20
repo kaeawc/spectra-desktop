@@ -125,7 +125,7 @@ const fn p(pid: u32, ppid: u32, name: &'static str, role: Role, runtime: Runtime
         signing: Some((SignStatus::Apple, "")),
         path: "",
         args: "",
-        user: "jason",
+        user: "user",
         cpu: 0.0,
         mb: 4.0,
         threads: 3,
@@ -165,11 +165,11 @@ impl P {
 const SLACK: (&str, &str, &str) = ("Slack", "/Applications/Slack.app", "com.tinyspeck.slackmacgap");
 const SAFARI: (&str, &str, &str) = ("Safari", "/Applications/Safari.app", "com.apple.Safari");
 const CODE: (&str, &str, &str) = ("Visual Studio Code", "/Applications/Visual Studio Code.app", "com.microsoft.VSCode");
-const NOTCHY: (&str, &str, &str) = ("Notchy", "/Users/jason/Applications/Notchy.app", "dev.jason.notchy");
+const NOTES_LITE: (&str, &str, &str) = ("Notes Lite", "/Users/user/Applications/Notes Lite.app", "com.example.noteslite");
 const BURROW: (&str, &str, &str) = ("Burrow VPN", "/Applications/Burrow VPN.app", "net.burrow.vpn");
 const ITERM: (&str, &str, &str) = ("iTerm", "/Applications/iTerm.app", "com.googlecode.iterm2");
 const TERMINAL: (&str, &str, &str) = ("Terminal", "/System/Applications/Utilities/Terminal.app", "com.apple.Terminal");
-const CLAUDE: (&str, &str, &str) = ("claude", "/Users/jason/.local/share/claude/claude.app", "com.anthropic.claude-code");
+const CLAUDE: (&str, &str, &str) = ("claude", "/Users/user/.local/share/claude/claude.app", "com.anthropic.claude-code");
 const OLLAMA: (&str, &str, &str) = ("Ollama", "/Applications/Ollama.app", "com.electron.ollama");
 
 use Role::{AiAgent, App as AppRole, AppHelper, Cli, Shell as ShellRole, System, Terminal};
@@ -209,7 +209,7 @@ fn sample_procs() -> Vec<P> {
             .signed(DeveloperId, "BQR82RBBHL")
             .at(
                 "/Applications/Slack.app/Contents/Frameworks/Slack Helper (Renderer).app/Contents/MacOS/Slack Helper (Renderer)",
-                "--type=renderer --user-data-dir=/Users/jason/Library/Application Support/Slack --app-path=/Applications/Slack.app/Contents/Resources/app.asar --enable-sandbox --lang=en-US --num-raster-threads=4 --renderer-client-id=7 --launch-time-ticks=4410129883 --shared-files --field-trial-handle=1718379636,r,1520137412 --seatbelt-client=64",
+                "--type=renderer --user-data-dir=/Users/user/Library/Application Support/Slack --app-path=/Applications/Slack.app/Contents/Resources/app.asar --enable-sandbox --lang=en-US --num-raster-threads=4 --renderer-client-id=7 --launch-time-ticks=4410129883 --shared-files --field-trial-handle=1718379636,r,1520137412 --seatbelt-client=64",
             )
             .load(6.2, 380.0, 21),
         p(902, 900, "Slack Helper (GPU)", AppHelper, Electron)
@@ -249,10 +249,10 @@ fn sample_procs() -> Vec<P> {
             .signed(DeveloperId, "UBF8T346G9")
             .at("/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Renderer).app/Contents/MacOS/Code Helper (Renderer)", "--type=renderer")
             .load(4.0, 344.0, 19),
-        p(930, 1, "Notchy", AppRole, Native)
-            .app(NOTCHY.0, NOTCHY.1, NOTCHY.2)
+        p(930, 1, "Notes Lite", AppRole, Native)
+            .app(NOTES_LITE.0, NOTES_LITE.1, NOTES_LITE.2)
             .signed(Adhoc, "")
-            .at("/Users/jason/Applications/Notchy.app/Contents/MacOS/Notchy", "")
+            .at("/Users/user/Applications/Notes Lite.app/Contents/MacOS/Notes Lite", "")
             .load(0.2, 38.0, 5),
         p(940, 1, "Burrow VPN", AppRole, Native)
             .app(BURROW.0, BURROW.1, BURROW.2)
@@ -289,12 +289,12 @@ fn sample_procs() -> Vec<P> {
         p(1200, 1101, "claude", AiAgent, Bun)
             .app(CLAUDE.0, CLAUDE.1, CLAUDE.2)
             .signed(DeveloperId, "Q6L2SF6YDW")
-            .at("/Users/jason/.local/share/claude/claude.app/Contents/MacOS/claude", "--resume")
+            .at("/Users/user/.local/share/claude/claude.app/Contents/MacOS/claude", "--resume")
             .load(9.4, 612.0, 22),
         p(1201, 1102, "claude", AiAgent, Bun)
             .app(CLAUDE.0, CLAUDE.1, CLAUDE.2)
             .signed(DeveloperId, "Q6L2SF6YDW")
-            .at("/Users/jason/.local/share/claude/claude.app/Contents/MacOS/claude", "")
+            .at("/Users/user/.local/share/claude/claude.app/Contents/MacOS/claude", "")
             .load(1.2, 288.0, 18),
         p(1210, 1103, "codex", AiAgent, Node)
             .signed(DeveloperId, "HX7739G8FX")
@@ -302,7 +302,7 @@ fn sample_procs() -> Vec<P> {
             .load(0.8, 154.0, 12),
         p(1220, 1105, "aider", AiAgent, Python)
             .signed(Adhoc, "")
-            .at("/opt/homebrew/bin/python3.12", "/Users/jason/.local/bin/aider --model sonnet")
+            .at("/opt/homebrew/bin/python3.12", "/Users/user/.local/bin/aider --model sonnet")
             .load(0.3, 212.0, 9),
         // Developer tools.
         p(4101, 1, "java", Cli, JvmRt)
@@ -316,7 +316,7 @@ fn sample_procs() -> Vec<P> {
             .signed(DeveloperId, "JCDTMS22B4")
             .at(
                 "/Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home/bin/java",
-                "-Xmx4g -XX:+HeapDumpOnOutOfMemoryError -cp /Users/jason/.gradle/wrapper/dists/gradle-8.10/lib/gradle-launcher-8.10.jar org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10",
+                "-Xmx4g -XX:+HeapDumpOnOutOfMemoryError -cp /Users/user/.gradle/wrapper/dists/gradle-8.10/lib/gradle-launcher-8.10.jar org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10",
             )
             .load(4.5, 3_420.0, 48),
         p(4103, 1, "java", Cli, JvmRt)
@@ -328,11 +328,11 @@ fn sample_procs() -> Vec<P> {
             .load(1.2, 420.0, 48),
         p(1300, 921, "rust-analyzer", Cli, Rust)
             .signed(Adhoc, "")
-            .at("/Users/jason/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rust-analyzer", "")
+            .at("/Users/user/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rust-analyzer", "")
             .load(138.0, 1_120.0, 18),
         p(1310, 921, "gopls", Cli, Go)
             .signed(Adhoc, "")
-            .at("/Users/jason/go/bin/gopls", "-mode=stdio")
+            .at("/Users/user/go/bin/gopls", "-mode=stdio")
             .load(0.9, 186.0, 14),
         p(1311, 1102, "gh", Cli, Go)
             .signed(DeveloperId, "4G9L8WJ34V")
@@ -340,7 +340,7 @@ fn sample_procs() -> Vec<P> {
             .load(0.0, 24.0, 8),
         p(1320, 1101, "node", Cli, Node)
             .signed(DeveloperId, "HX7739G8FX")
-            .at("/opt/homebrew/bin/node", "/Users/jason/site/node_modules/.bin/vite --port 5173")
+            .at("/opt/homebrew/bin/node", "/Users/user/site/node_modules/.bin/vite --port 5173")
             .load(2.6, 174.0, 11),
         p(1321, 1103, "bun", Cli, Bun)
             .signed(Adhoc, "")
@@ -352,7 +352,7 @@ fn sample_procs() -> Vec<P> {
             .load(0.2, 61.0, 10),
         p(1340, 1104, "python3", Cli, Python)
             .signed(Unsigned, "")
-            .at("/Users/jason/.pyenv/versions/3.12.4/bin/python3", "-m http.server 8000")
+            .at("/Users/user/.pyenv/versions/3.12.4/bin/python3", "-m http.server 8000")
             .load(0.0, 19.0, 2),
         p(1350, 1110, "ruby", Cli, Ruby)
             .at("/usr/bin/ruby", "/usr/local/bin/pod install")
@@ -365,12 +365,12 @@ fn sample_procs() -> Vec<P> {
             .load(0.5, 66.0, 16),
         p(1380, 1101, "mytool", Cli, Unknown)
             .unread()
-            .at("/Users/jason/bin/mytool", "--watch")
+            .at("/Users/user/bin/mytool", "--watch")
             .load(0.0, 5.0, 2),
         // A second JDK's `java`: same name, another program.
         p(4110, 1102, "java", Cli, JvmRt)
             .signed(DeveloperId, "TDTHCUPYFR")
-            .at("/Library/Java/JavaVirtualMachines/zulu-17.jdk/Contents/Home/bin/java", "-jar /Users/jason/tools/bundletool.jar build-apks")
+            .at("/Library/Java/JavaVirtualMachines/zulu-17.jdk/Contents/Home/bin/java", "-jar /Users/user/tools/bundletool.jar build-apks")
             .load(3.2, 310.0, 31),
         // What the real feed lists without a path or a signature: a zombie and processes caught
         // as they exited.
@@ -733,17 +733,17 @@ pub fn tool_output(tool: Tool) -> &'static str {
             "summary":{"samples":11,"min_kib":1146880,"max_kib":1200128,"first_kib":1146880,"last_kib":1200128,"net_change_kib":53248,
                        "growth_kib_per_min":159744,"verdict":"growing"},"growers":[]}"#,
         Tool::Lineage => r#"{"pid":1300,"ancestors":[
-              {"pid":1300,"ppid":921,"user":"jason","command":"rust-analyzer"},
-              {"pid":921,"ppid":920,"user":"jason","command":"Code Helper (Plugin)"},
-              {"pid":920,"ppid":1,"user":"jason","command":"Code"},
+              {"pid":1300,"ppid":921,"user":"user","command":"rust-analyzer"},
+              {"pid":921,"ppid":920,"user":"user","command":"Code Helper (Plugin)"},
+              {"pid":920,"ppid":1,"user":"user","command":"Code"},
               {"pid":1,"ppid":0,"user":"root","command":"launchd"}],
-            "tree":{"pid":1300,"ppid":921,"user":"jason","command":"rust-analyzer","rss_kib":1146880,"cpu_pct":138,"count":3,"subtree_rss_kib":1160192,"subtree_cpu_pct":139.5,
-              "children":[{"pid":7533,"ppid":1300,"user":"jason","command":"<defunct>","rss_kib":0,"cpu_pct":0,"count":1,"subtree_rss_kib":0,"subtree_cpu_pct":0},
-                          {"pid":7540,"ppid":1300,"user":"jason","command":"rust-analyzer-proc-macro-srv","rss_kib":13312,"cpu_pct":1.5,"count":1,"subtree_rss_kib":13312,"subtree_cpu_pct":1.5}]}}"#,
-        Tool::Owner => r#"{"target":{"kind":"pid","raw":"1300","pid":1300},"holders":[{"pid":1300,"user":"jason","command":"rust-analyzer",
-            "executable":"/Users/jason/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rust-analyzer","started":"2026-11-19T10:40:04-05:00","hold":"process",
+            "tree":{"pid":1300,"ppid":921,"user":"user","command":"rust-analyzer","rss_kib":1146880,"cpu_pct":138,"count":3,"subtree_rss_kib":1160192,"subtree_cpu_pct":139.5,
+              "children":[{"pid":7533,"ppid":1300,"user":"user","command":"<defunct>","rss_kib":0,"cpu_pct":0,"count":1,"subtree_rss_kib":0,"subtree_cpu_pct":0},
+                          {"pid":7540,"ppid":1300,"user":"user","command":"rust-analyzer-proc-macro-srv","rss_kib":13312,"cpu_pct":1.5,"count":1,"subtree_rss_kib":13312,"subtree_cpu_pct":1.5}]}}"#,
+        Tool::Owner => r#"{"target":{"kind":"pid","raw":"1300","pid":1300},"holders":[{"pid":1300,"user":"user","command":"rust-analyzer",
+            "executable":"/Users/user/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rust-analyzer","started":"2026-11-19T10:40:04-05:00","hold":"process",
             "chain":[{"pid":921,"command":"Code Helper (Plugin)"},{"pid":920,"command":"Code"},{"pid":1,"command":"launchd"}]}]}"#,
-        Tool::Runtime => r#"{"pid":1300,"command":"rust-analyzer","executable_path":"/Users/jason/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rust-analyzer",
+        Tool::Runtime => r#"{"pid":1300,"command":"rust-analyzer","executable_path":"/Users/user/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rust-analyzer",
             "runtime":"rust","evidence":"Mach-O carries Rust panic symbols (rust_begin_unwind)",
             "capabilities":[{"name":"user-space CPU sample","how":"spectra sample 1300"},
                             {"name":"attach a native debugger","how":"rust-lldb -p 1300"},
