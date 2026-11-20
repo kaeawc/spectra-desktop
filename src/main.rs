@@ -9,20 +9,19 @@ mod findings;
 mod groups;
 mod proc_findings;
 mod procs;
+mod run;
 mod sample;
 mod ui;
 
 use std::time::Duration;
 
-use app::App;
-use rune::{AppSpec, Chrome, KeyEvent, Tx};
-use rune_kit::shell;
+use app::{App, REFRESH};
+use rune::{AppSpec, Chrome, Tx};
 
-/// How long each feed rests after a reading lands before the next. JVM readings take Spectra
-/// about 17 s; process readings about 0.2 s.
-const REFRESH: Duration = Duration::from_secs(2);
 /// How long to wait before asking a Spectra that's too old again, in case it was updated.
 const RETRY_OLD: Duration = Duration::from_secs(30);
+/// How often the "Updated … ago" status is looked at while nothing lands.
+const STATUS_TICK: Duration = Duration::from_secs(1);
 
 fn setup(s: &mut App, wake: rune::Waker) {
     // A headless render of a sample scene shows the sample, not this machine.
@@ -57,7 +56,9 @@ fn setup(s: &mut App, wake: rune::Waker) {
     }
 }
 
-fn poll(s: &mut App, _: f64, _: &mut Tx) -> bool {
+fn poll(s: &mut App, clock: f64, tx: &mut Tx) -> bool {
+    let status = s.feed_status();
+    s.now = clock;
     let mut landed = false;
     while let Some(feed) = s.feed.as_ref().and_then(|rx| rx.try_recv().ok()) {
         s.land(feed);
@@ -67,15 +68,11 @@ fn poll(s: &mut App, _: f64, _: &mut Tx) -> bool {
         s.land_procs(feed);
         landed = true;
     }
-    landed
-}
-
-fn on_key(s: &mut App, ev: &KeyEvent, _: &mut Tx) -> bool {
-    if shell::is_sidebar_toggle(ev) {
-        s.sidebar.toggle();
-        return true;
+    // A hung Spectra sends nothing, so look again on a timer to say the numbers are getting old.
+    if s.has_processes() {
+        tx.wake_after(STATUS_TICK);
     }
-    false
+    landed || s.feed_status() != status
 }
 
 fn main() {
@@ -92,12 +89,14 @@ fn main() {
             ("apps", sample::apps_scene),
             ("group", sample::group_scene),
             ("process", sample::process_scene),
+            ("signed", sample::signed_scene),
             ("detail", sample::detail_scene),
+            ("stale", sample::stale_scene),
             ("old", sample::old_scene),
         ],
         setup: Some(setup),
         poll: Some(poll),
-        on_key: Some(on_key),
+        on_key: Some(ui::on_key),
         ..AppSpec::new("Spectra", (1100.0, 700.0), app::init, ui::view)
     };
     rune::App::new(spec).chrome(chrome).run();

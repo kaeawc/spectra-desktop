@@ -9,7 +9,13 @@ use crate::groups::{Category, Nav};
 use crate::procs::{AppInfo, ProcError, Process, Role, Runtime, SignStatus, Signing};
 
 /// Readings of every process the sample lands, enough for the memory-growth rule.
-const PROC_READINGS: usize = 12;
+const PROC_READINGS: usize = crate::proc_findings::GROWTH_READINGS + 4;
+/// The sample's wall clock: 2026-11-20T12:00:00Z, hours after every sample process started.
+pub const SAMPLE_NOW: i64 = 1_795_176_000;
+
+fn sample_now() -> i64 {
+    SAMPLE_NOW
+}
 
 fn sample_jvms(s: &mut App) {
     // `young` is the leaking JVM's young collections so far: (count, seconds), so its GC and
@@ -149,6 +155,7 @@ const BURROW: (&str, &str, &str) = ("Burrow VPN", "/Applications/Burrow VPN.app"
 const ITERM: (&str, &str, &str) = ("iTerm", "/Applications/iTerm.app", "com.googlecode.iterm2");
 const TERMINAL: (&str, &str, &str) = ("Terminal", "/System/Applications/Utilities/Terminal.app", "com.apple.Terminal");
 const CLAUDE: (&str, &str, &str) = ("claude", "/Users/jason/.local/share/claude/claude.app", "com.anthropic.claude-code");
+const OLLAMA: (&str, &str, &str) = ("Ollama", "/Applications/Ollama.app", "com.electron.ollama");
 
 use Role::{AiAgent, App as AppRole, AppHelper, Cli, Shell as ShellRole, System, Terminal};
 use Runtime::{Bun, Deno, Electron, Go, Jvm as JvmRt, Native, Node, Python, Ruby, Rust, Shell, Unknown};
@@ -336,7 +343,8 @@ fn sample_procs() -> Vec<P> {
             .at("/usr/bin/ruby", "/usr/local/bin/pod install")
             .load(12.0, 140.0, 4),
         p(1360, 1110, "deploy.sh", Cli, Shell).at("/bin/bash", "./scripts/deploy.sh staging").load(0.0, 2.4, 1),
-        p(1370, 1, "ollama", Cli, Go)
+        p(1370, 1, "ollama", AiAgent, Go)
+            .app(OLLAMA.0, OLLAMA.1, OLLAMA.2)
             .signed(DeveloperId, "3MU9H2V9Y9")
             .at("/Applications/Ollama.app/Contents/Resources/ollama", "serve")
             .load(0.5, 66.0, 16),
@@ -344,6 +352,15 @@ fn sample_procs() -> Vec<P> {
             .unread()
             .at("/Users/jason/bin/mytool", "--watch")
             .load(0.0, 5.0, 2),
+        // A second JDK's `java`: same name, another program.
+        p(4110, 1102, "java", Cli, JvmRt)
+            .signed(DeveloperId, "TDTHCUPYFR")
+            .at("/Library/Java/JavaVirtualMachines/zulu-17.jdk/Contents/Home/bin/java", "-jar /Users/jason/tools/bundletool.jar build-apks")
+            .load(3.2, 310.0, 31),
+        // What the real feed lists without a path or a signature: a zombie and processes caught
+        // as they exited.
+        p(7533, 1300, "<defunct>", Cli, Unknown).unread().load(0.0, 0.0, 0),
+        p(7670, 1110, "(bash)", Cli, Unknown).unread().load(0.2, 2.3, 0),
     ]
 }
 
@@ -356,6 +373,7 @@ fn evidence(x: &P) -> Vec<String> {
         _ => "role: no app, system, shell, terminal or agent signal".to_owned(),
     };
     let runtime = match x.runtime {
+        _ if x.path.is_empty() => "runtime: executable path not visible".to_owned(),
         Electron => "runtime: bundle links Electron Framework.framework".to_owned(),
         JvmRt => "runtime: interpreter executable java".to_owned(),
         Go => "runtime: Mach-O has a __go_buildinfo section".to_owned(),
@@ -366,10 +384,31 @@ fn evidence(x: &P) -> Vec<String> {
     };
     let mut out = vec![role, runtime];
     if let Some((status, team)) = x.signing {
-        let team = if team.is_empty() { String::new() } else { format!(", team {team}") };
-        out.push(format!("signing: {}{team} as displayed by codesign -dv", status.label().to_lowercase()));
+        out.push(signing_evidence(status, team));
     }
     out
+}
+
+/// The `signing:` line as the real feed words it: only Apple's signatures are checked against
+/// their anchor; the rest are what `codesign -dv` displays.
+fn signing_evidence(status: SignStatus, team: &str) -> String {
+    const VERDICT: &str = "verdict is for the file on disk";
+    let id = match status {
+        SignStatus::Apple => {
+            return format!(r#"signing: platform binary validated by codesign --verify --ignore-resources -R="anchor apple"; {VERDICT}"#);
+        }
+        // The real feed rarely has these; worded like the displayed ones.
+        Invalid => "invalid",
+        Unsigned => "unsigned",
+        Adhoc => "adhoc",
+        DeveloperId => "developer_id",
+        SignStatus::Unknown => "unknown",
+    };
+    if team.is_empty() {
+        format!("signing: {id} as displayed by codesign -dv, not validated; {VERDICT}")
+    } else {
+        format!("signing: {id}, team {team} as displayed by codesign -dv, not validated; {VERDICT}")
+    }
 }
 
 fn process(x: &P, reading: usize) -> Process {
@@ -381,11 +420,16 @@ fn process(x: &P, reading: usize) -> Process {
         _ => x.cpu * wobble,
     };
     let mb = match x.pid {
-        901 => x.mb + 14.0 * step,
+        901 => x.mb + 5.0 * step,
         _ => x.mb * (1.0 + (wobble - 1.0) * 0.1),
     };
-    let cmdline = if x.args.is_empty() { x.path.to_owned() } else { format!("{} {}", x.path, x.args) };
-    Process {
+    // Without a path the real feed's command line is the bare name, as `ps` shows it.
+    let cmdline = match (x.path, x.args) {
+        ("", _) => x.name.to_owned(),
+        (path, "") => path.to_owned(),
+        (path, args) => format!("{path} {args}"),
+    };
+    let mut p = Process {
         pid: x.pid,
         ppid: x.ppid,
         uid: if x.user == "root" { 0 } else { 501 },
@@ -406,15 +450,20 @@ fn process(x: &P, reading: usize) -> Process {
             status,
             team_id: team.into(),
             hardened_runtime: status == DeveloperId,
+            validated: None,
         }),
         evidence: evidence(x),
-    }
+        elapsed: None,
+    };
+    p.settle();
+    p
 }
 
 /// Lands `PROC_READINGS` readings of the sample processes.
 pub fn land_sample_procs(s: &mut App) {
     let all = sample_procs();
     s.cores = 10;
+    s.wall = sample_now;
     for i in 0..PROC_READINGS {
         s.land_procs(Ok(all.iter().map(|x| process(x, i)).collect()));
     }
@@ -424,14 +473,29 @@ pub fn land_sample_procs(s: &mut App) {
 pub fn sample_scene(s: &mut App) {
     sample_jvms(s);
     land_sample_procs(s);
-    s.expanded = s.findings().first().map(Finding::id);
+    s.expanded = s.findings.first().map(Finding::id);
 }
 
 /// The leaking JVM's page.
 pub fn detail_scene(s: &mut App) {
     sample_scene(s);
-    s.selected = Some(4101);
+    s.select(Some(4101));
     s.expanded = None;
+}
+
+/// A claude agent's page: a Developer ID signature, as displayed and not verified.
+pub fn signed_scene(s: &mut App) {
+    sample_scene(s);
+    s.show(Nav::Category(Category::Agents));
+    s.open(1200);
+    s.expanded = None;
+}
+
+/// Every process, from a reading 14 s ago; the one since failed.
+pub fn stale_scene(s: &mut App) {
+    all_scene(s);
+    s.proc_updated = Some(s.now - 14.0);
+    s.land_procs(Err(ProcError::Failed("spectra process failed: no processes found".into())));
 }
 
 /// Every process.
@@ -456,7 +520,7 @@ pub fn group_scene(s: &mut App) {
 pub fn process_scene(s: &mut App) {
     sample_scene(s);
     s.show(Nav::Category(Category::Apps));
-    s.selected = Some(901);
+    s.open(901);
     s.expanded = None;
 }
 
@@ -464,7 +528,7 @@ pub fn process_scene(s: &mut App) {
 pub fn old_scene(s: &mut App) {
     sample_jvms(s);
     s.land_procs(Err(ProcError::TooOld("spectra can't classify processes (it has no --classify).".into())));
-    s.expanded = s.findings().first().map(Finding::id);
+    s.expanded = s.findings.first().map(Finding::id);
 }
 
 #[cfg(test)]
@@ -485,9 +549,21 @@ mod tests {
         }
         let runtimes = Rt::ALL.iter().filter(|r| s.procs.iter().any(|p| p.runtime == **r)).count();
         assert_eq!(runtimes, Rt::ALL.len(), "every runtime");
-        let rules: Vec<&str> = s.findings().iter().map(|f| f.rule).collect();
+        let rules: Vec<&str> = s.findings.iter().map(|f| f.rule).collect();
         for rule in ["proc-busy-cpu", "proc-memory-growth", "proc-invalid-signature", "proc-unidentified", "jvm-heap-pressure"] {
             assert!(rules.contains(&rule), "{rule} in {rules:?}");
         }
+        // Like the real feed: Apple's checked, the rest only as displayed, and some rows with
+        // neither a path nor a signature.
+        for p in &s.procs {
+            match p.sign_status() {
+                SignStatus::Apple => assert!(p.validated(), "{}", p.name()),
+                SignStatus::Unknown => assert!(p.signing_evidence().is_none()),
+                _ => assert!(!p.validated() && p.signing_evidence().unwrap().contains("not validated"), "{}", p.name()),
+            }
+        }
+        assert!(s.procs.iter().any(|p| p.executable_path.is_empty() && p.signing.is_none()));
+        let ollama = s.process(1370).unwrap();
+        assert_eq!((ollama.role, ollama.bundle_path()), (AiAgent, Some("/Applications/Ollama.app")));
     }
 }

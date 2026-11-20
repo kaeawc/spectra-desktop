@@ -1,15 +1,21 @@
 //! Findings about any process, from the process feed and each process's recent readings:
-//! sustained CPU, memory that only climbs, broken signatures, and how much runs unsigned.
+//! sustained CPU, memory that keeps climbing, broken signatures, and how much runs unsigned.
 
 use crate::findings::{Chart, Finding, Link, Severity};
 use crate::procs::{ProcSample, Process, SignStatus, fmt_count, fmt_cpu, fmt_mem};
 
-/// Readings a process must stay busy for (about 16 s at one every 2 s).
-pub const CPU_WINDOW: usize = 8;
+/// Readings a process must stay busy for: 30 rests of at least 2 s between them, so over a
+/// minute. A compiler pegging a core for a few seconds is doing its job.
+pub const CPU_WINDOW: usize = 31;
 /// Percent of one core that counts as busy.
 pub const BUSY_CPU: f64 = 80.0;
-/// The fewest readings memory growth is judged on.
-pub const GROWTH_READINGS: usize = 10;
+/// The fewest readings memory growth is judged on: 59 rests of at least 2 s, about two minutes.
+/// Every app climbs for a while after it starts.
+pub const GROWTH_READINGS: usize = 60;
+/// How old a process must be before its CPU or memory trend counts. Startup is busy and grows.
+pub const SETTLED_SECS: i64 = 5 * 60;
+/// The most memory may fall between two readings and still count as climbing.
+const DIP: f64 = 0.02;
 
 /// The average CPU over the last `CPU_WINDOW` readings, when every one of them was busy.
 pub fn sustained_cpu(history: &[ProcSample]) -> Option<f64> {
@@ -22,9 +28,9 @@ pub fn sustained_cpu(history: &[ProcSample]) -> Option<f64> {
         .then(|| tail.iter().map(|s| s.cpu).sum::<f64>() / CPU_WINDOW as f64)
 }
 
-/// `(percent, KiB)` grown across the whole history, when memory climbed steadily: at least 20%
-/// and 50 MB in all, no reading lower than the one before by more than 2%, and at least
-/// four in five steps not going down.
+/// `(percent, KiB)` grown across the whole history, when memory climbed steadily over at least
+/// `GROWTH_READINGS`: at least 20% and 50 MB in all, no reading lower than the one before by
+/// more than 2%, and at least four in five steps not going down.
 pub fn memory_growth(history: &[ProcSample]) -> Option<(f64, f64)> {
     if history.len() < GROWTH_READINGS {
         return None;
@@ -38,7 +44,7 @@ pub fn memory_growth(history: &[ProcSample]) -> Option<(f64, f64)> {
     let steps = history.len() - 1;
     let mut up = 0;
     for w in history.windows(2) {
-        if w[1].rss_kib < w[0].rss_kib * 0.98 {
+        if w[1].rss_kib < w[0].rss_kib * (1.0 - DIP) {
             return None;
         }
         if w[1].rss_kib >= w[0].rss_kib {
@@ -48,11 +54,17 @@ pub fn memory_growth(history: &[ProcSample]) -> Option<(f64, f64)> {
     (up * 5 >= steps * 4).then_some((grown / first * 100.0, grown))
 }
 
+/// Whether `p` has run long enough at `now` (Unix seconds) for a trend to mean something. One
+/// whose age Spectra didn't say counts as settled; the reading windows still apply.
+pub fn settled(p: &Process, now: i64) -> bool {
+    p.age_secs(now).is_none_or(|age| age >= SETTLED_SECS)
+}
+
 fn finding(p: &Process, rule: &'static str, severity: Severity, title: String, detail: String, fix: &str, chart: Chart) -> Finding {
     Finding {
         rule,
         pid: p.pid,
-        subject: p.name(),
+        subject: p.name().into_owned(),
         severity,
         title,
         detail,
@@ -62,18 +74,19 @@ fn finding(p: &Process, rule: &'static str, severity: Severity, title: String, d
     }
 }
 
-/// Every process finding, in feed order; `history` gives a pid's readings, oldest first.
-pub fn diagnose<'a>(procs: &[Process], history: &dyn Fn(u32) -> &'a [ProcSample]) -> Vec<Finding> {
+/// Every process finding, in feed order; `history` gives a pid's readings, oldest first, and
+/// `now` is the time in Unix seconds, to tell a process that just started.
+pub fn diagnose<'a>(procs: &[Process], history: &dyn Fn(u32) -> &'a [ProcSample], now: i64) -> Vec<Finding> {
     let mut out = Vec::new();
     for p in procs {
-        let h = history(p.pid);
+        let h = if settled(p, now) { history(p.pid) } else { &[] };
         if let Some(avg) = sustained_cpu(h) {
             out.push(finding(
                 p,
                 "proc-busy-cpu",
                 Severity::Warning,
-                format!("Busy: {} CPU for the last {CPU_WINDOW} readings", fmt_cpu(avg)),
-                format!("It stayed above {BUSY_CPU:.0}% in every reading; 100% is one full core."),
+                format!("Busy: {} CPU for over a minute", fmt_cpu(avg)),
+                format!("It stayed above {BUSY_CPU:.0}% in each of the last {CPU_WINDOW} readings; 100% is one full core."),
                 "If it shouldn't be working this hard, open it to see what it runs and who started it.",
                 Chart::Cpu,
             ));
@@ -84,13 +97,18 @@ pub fn diagnose<'a>(procs: &[Process], history: &dyn Fn(u32) -> &'a [ProcSample]
                 "proc-memory-growth",
                 Severity::Warning,
                 format!("Memory grew {pct:.0}% to {}", fmt_mem(p.rss_kib)),
-                format!("Up {} across the last {} readings, and it never came back down.", fmt_mem(kib), h.len()),
-                "Memory that only climbs is how a leak looks. Restart it if it keeps growing.",
+                format!(
+                    "Up {} across the last {} readings, and it never fell more than {:.0}% from one reading to the next.",
+                    fmt_mem(kib),
+                    h.len(),
+                    DIP * 100.0
+                ),
+                "Memory that keeps climbing is how a leak looks. Restart it if it keeps growing.",
                 Chart::Memory,
             ));
         }
         if p.sign_status() == SignStatus::Invalid {
-            let path = if p.executable_path.is_empty() { p.name() } else { p.executable_path.clone() };
+            let path = if p.executable_path.is_empty() { p.name().into_owned() } else { p.executable_path.clone() };
             out.push(finding(
                 p,
                 "proc-invalid-signature",
@@ -116,7 +134,7 @@ pub fn unidentified(procs: &[Process]) -> Option<Finding> {
     }
     let adhoc = found.iter().filter(|p| p.sign_status() == SignStatus::Adhoc).count();
     let unsigned = found.len() - adhoc;
-    let mut names: Vec<String> = found.iter().map(|p| p.name()).collect();
+    let mut names: Vec<String> = found.iter().map(|p| p.name().into_owned()).collect();
     names.sort();
     names.dedup();
     let shown = names.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
@@ -162,20 +180,22 @@ mod tests {
 
     #[test]
     fn busy_in_every_recent_reading_is_sustained() {
-        assert_eq!(sustained_cpu(&cpu(&[100.0; 8])), Some(100.0));
-        assert_eq!(sustained_cpu(&cpu(&[0.0, 0.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0])), Some(90.0));
-        let mut dip = vec![100.0; 8];
+        assert_eq!(sustained_cpu(&cpu(&[100.0; CPU_WINDOW])), Some(100.0));
+        let mut late = vec![0.0, 0.0];
+        late.extend([90.0; CPU_WINDOW]);
+        assert_eq!(sustained_cpu(&cpu(&late)), Some(90.0));
+        let mut dip = vec![100.0; CPU_WINDOW];
         dip[4] = 20.0;
         assert_eq!(sustained_cpu(&cpu(&dip)), None, "one quiet reading breaks it");
-        assert_eq!(sustained_cpu(&cpu(&[100.0; 7])), None, "too few readings");
+        assert_eq!(sustained_cpu(&cpu(&[100.0; 8])), None, "16 s of a pegged core is not a finding");
     }
 
     #[test]
     fn memory_that_only_climbs_is_growth() {
-        let climbing: Vec<f64> = (0..12).map(|i| 200.0 + 10.0 * i as f64).collect();
+        let climbing: Vec<f64> = (0..GROWTH_READINGS).map(|i| 200.0 + 2.0 * i as f64).collect();
         let (pct, kib) = memory_growth(&mem(&climbing)).unwrap();
-        assert_eq!(pct.round(), 55.0);
-        assert_eq!(kib, 110.0 * 1024.0);
+        assert_eq!(pct.round(), 59.0);
+        assert_eq!(kib, 118.0 * 1024.0);
         // Flat stretches are fine.
         let mut steps = climbing.clone();
         steps[3] = steps[2];
@@ -185,9 +205,12 @@ mod tests {
         sawtooth[6] = 150.0;
         assert_eq!(memory_growth(&mem(&sawtooth)), None);
         // Too little to matter.
-        let small: Vec<f64> = (0..12).map(|i| 10.0 + i as f64).collect();
+        let small: Vec<f64> = (0..GROWTH_READINGS).map(|i| 10.0 + 0.2 * i as f64).collect();
         assert_eq!(memory_growth(&mem(&small)), None, "under 50 MB");
-        assert_eq!(memory_growth(&mem(&climbing[..9])), None, "too few readings");
+        // Ten readings of +20% and +50 MB is any app starting up.
+        let startup: Vec<f64> = (0..10).map(|i| 200.0 + 10.0 * i as f64).collect();
+        assert_eq!(memory_growth(&mem(&startup)), None, "too few readings");
+        assert_eq!(memory_growth(&mem(&climbing[..GROWTH_READINGS - 1])), None);
     }
 
     #[test]
@@ -200,7 +223,7 @@ mod tests {
         v[3].signing = sign(SignStatus::Adhoc);
         v[4].signing = sign(SignStatus::Unsigned);
         let empty: &[ProcSample] = &[];
-        let f = diagnose(&v, &|_| empty);
+        let f = diagnose(&v, &|_| empty, 0);
         let rules: Vec<(&str, u32, Severity)> = f.iter().map(|f| (f.rule, f.pid, f.severity)).collect();
         assert_eq!(rules, [("proc-invalid-signature", 2, Severity::Critical), ("proc-unidentified", 0, Severity::Info)]);
         assert_eq!(f[0].link, Link::Process(2));
@@ -210,15 +233,46 @@ mod tests {
         assert!(unidentified(&v[..2]).is_none());
     }
 
+    /// 2026-11-20T12:00:00Z.
+    const NOON: i64 = 1_795_176_000;
+
+    fn started(mut p: Process, secs_ago: i64) -> Process {
+        let t = NOON - secs_ago;
+        // As UTC; `parse_rfc3339` is checked against real offsets in `procs`.
+        let (d, s) = (t.div_euclid(86_400), t.rem_euclid(86_400));
+        assert_eq!(d, NOON / 86_400, "same day");
+        p.started_at = format!("2026-11-20T{:02}:{:02}:{:02}Z", s / 3600, s / 60 % 60, s % 60);
+        p
+    }
+
+    fn rising(readings: usize) -> Vec<ProcSample> {
+        (0..readings).map(|i| ProcSample { cpu: 150.0, rss_kib: (300.0 + 5.0 * i as f64) * 1024.0 }).collect()
+    }
+
     #[test]
     fn busy_and_growing_processes_link_to_themselves() {
-        let v = vec![proc(7, "busy", 150.0, 1.0)];
-        let h: Vec<ProcSample> = (0..12).map(|i| ProcSample { cpu: 150.0, rss_kib: (300.0 + 20.0 * i as f64) * 1024.0 }).collect();
-        let f = diagnose(&v, &|_| h.as_slice());
+        let v = vec![started(proc(7, "busy", 150.0, 1.0), 3600)];
+        let h = rising(PROC_READINGS);
+        let f = diagnose(&v, &|_| h.as_slice(), NOON);
         let rules: Vec<&str> = f.iter().map(|f| f.rule).collect();
         assert_eq!(rules, ["proc-busy-cpu", "proc-memory-growth"]);
         assert!(f.iter().all(|f| f.link == Link::Process(7)));
-        assert_eq!(f[0].title, "Busy: 150.0% CPU for the last 8 readings");
+        assert_eq!(f[0].title, "Busy: 150.0% CPU for over a minute");
         assert_eq!(f[0].chart, Chart::Cpu);
+        assert!(f[1].detail.contains("never fell more than 2%"), "{}", f[1].detail);
+    }
+
+    const PROC_READINGS: usize = crate::app::PROC_HISTORY;
+
+    #[test]
+    fn a_process_that_just_started_has_no_trend_findings() {
+        let h = rising(PROC_READINGS);
+        let young = vec![started(proc(7, "rustc", 150.0, 1.0), 60)];
+        assert!(diagnose(&young, &|_| h.as_slice(), NOON).is_empty(), "a minute old");
+        let old = vec![started(proc(7, "rustc", 150.0, 1.0), SETTLED_SECS)];
+        assert_eq!(diagnose(&old, &|_| h.as_slice(), NOON).len(), 2, "five minutes old");
+        // An old process with only a short history isn't judged either.
+        let short = rising(20);
+        assert!(diagnose(&old, &|_| short.as_slice(), NOON).is_empty());
     }
 }

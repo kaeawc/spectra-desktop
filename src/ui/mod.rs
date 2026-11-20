@@ -10,15 +10,27 @@ mod process;
 #[cfg(test)]
 mod tests;
 
-use rune::{Cx, El, ScrollSpec, col};
-use rune_kit::shell::{Sidebar, SidebarRow, SidebarSection, SplitView, Toolbar};
+use rune::{Cx, El, Key, KeyEvent, ScrollSpec, Tx, col};
+use rune_kit::shell::{self, Sidebar, SidebarRow, SidebarSection, SplitView, Toolbar};
 use rune_kit::{Button, ButtonVariant, Kit};
 
 use crate::app::App;
-use crate::findings::Severity;
 use crate::groups::{Category, Nav};
 use crate::procs::{Runtime, fmt_count};
 use card::dot;
+
+/// Keys nothing focused took: the sidebar toggle, and Esc or Cmd-[ to go back from a page.
+pub fn on_key(s: &mut App, ev: &KeyEvent, _: &mut Tx) -> bool {
+    if shell::is_sidebar_toggle(ev) {
+        s.sidebar.toggle();
+        return true;
+    }
+    if s.selected.is_some() && (ev.key == Key::Escape || ev.is_command('[')) {
+        s.back();
+        return true;
+    }
+    false
+}
 
 fn place(s: &App, nav: Nav, key: String, count: Option<usize>, k: &Kit) -> El {
     let mut r = SidebarRow::new(nav.title())
@@ -32,27 +44,20 @@ fn place(s: &App, nav: Nav, key: String, count: Option<usize>, k: &Kit) -> El {
 }
 
 fn sidebar(s: &App, k: &Kit) -> El {
-    let problems = s
-        .findings()
-        .iter()
-        .filter(|f| f.severity < Severity::Info)
-        .count();
+    let problems = s.problems();
     let overview = place(s, Nav::Overview, "overview".into(), Some(problems).filter(|n| *n > 0), k);
     let mut sb = Sidebar::new().header(overview);
     if s.has_processes() {
-        let count = |f: &dyn Fn(&crate::procs::Process) -> bool| s.procs.iter().filter(|p| f(p)).count();
         sb = sb.child(place(s, Nav::All, "all".into(), Some(s.procs.len()), k));
-        let kinds = Category::ALL.iter().map(|&c| {
-            let n = count(&|p| c.holds(p.role));
+        let kinds = Category::ALL.iter().zip(s.stats.kinds).map(|(&c, n)| {
             place(s, Nav::Category(c), format!("cat-{}", c.id()), Some(n), k)
         });
         sb = sb.section(SidebarSection::new("Kinds").key("kinds").rows(kinds));
         let runtimes: Vec<El> = Runtime::ALL
             .iter()
-            .filter_map(|&r| {
-                let n = count(&|p| p.runtime == r);
-                (n > 0).then(|| place(s, Nav::Runtime(r), format!("rt-{}", r.id()), Some(n), k))
-            })
+            .zip(s.stats.runtimes)
+            .filter(|(_, n)| *n > 0)
+            .map(|(&r, n)| place(s, Nav::Runtime(r), format!("rt-{}", r.id()), Some(n), k))
             .collect();
         sb = sb.section(SidebarSection::new("Runtimes").key("runtimes").rows(runtimes));
     } else if !s.jvms.is_empty() {
@@ -97,28 +102,30 @@ fn page_of(s: &App) -> Page<'_> {
     }
 }
 
+/// What a page is called: a JVM by what it runs, anything else by its name.
+fn page_name(s: &App, pid: u32) -> String {
+    match (s.jvm(pid), s.process(pid)) {
+        (Some(j), _) => j.name(),
+        (None, Some(p)) => p.name().into_owned(),
+        (None, None) => format!("pid {pid}"),
+    }
+}
+
 pub fn view(s: &App, cx: &mut Cx<App>) -> El {
     let k = Kit::neutral(cx.system_dark());
     let page = page_of(s);
     let (body, title) = match page {
-        Page::Process(p) => {
-            let title = s.jvm(p.pid).map_or_else(|| p.name(), |j| j.name());
-            (process::page(s, p, &k), title)
-        }
+        Page::Process(p) => (process::page(s, p, &k), page_name(s, p.pid)),
         Page::Jvm(j) => (detail::detail(s, j, &k), j.name()),
         Page::List => (list::list(s, &k), s.nav.title().to_owned()),
         Page::Home => {
-            let findings = s.findings();
-            let problems = findings
-                .iter()
-                .filter(|f| f.severity < Severity::Info)
-                .count();
+            let problems = s.problems();
             let title = if problems == 0 {
                 "Nothing needs attention".to_owned()
             } else {
                 format!("{problems} to look at")
             };
-            (home::home(s, &findings, &k), title)
+            (home::home(s, &k), title)
         }
     };
     // The list scrolls inside its table; every other page scrolls as a whole.
@@ -135,9 +142,10 @@ pub fn view(s: &App, cx: &mut Cx<App>) -> El {
     };
     let mut toolbar = Toolbar::new().title(title);
     if s.selected.is_some() {
-        let back = Button::new(format!("‹ {}", s.nav.title()))
+        let to = s.back_to().map_or_else(|| s.nav.title().to_owned(), |pid| page_name(s, pid));
+        let back = Button::new(format!("‹ {to}"))
             .variant(ButtonVariant::Ghost)
-            .on_press(|s: &mut App| s.select(None))
+            .on_press(|s: &mut App| s.back())
             .build(&k)
             .key("back");
         toolbar = toolbar.leading(back);

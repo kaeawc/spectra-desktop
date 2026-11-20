@@ -1,8 +1,13 @@
 //! The process feed: `spectra process -json --classify`, every process on the machine with what
 //! Spectra could tell about it (its role, runtime, owning app and signature).
 
-use serde::Deserialize;
+use std::borrow::Cow;
 use std::process::Command;
+use std::time::Duration;
+
+use serde::Deserialize;
+
+use crate::run::{self, RunError};
 
 /// What a process is for, as Spectra classifies it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
@@ -199,6 +204,37 @@ pub struct Signing {
     pub status: SignStatus,
     pub team_id: String,
     pub hardened_runtime: bool,
+    /// Whether Spectra checked the signature against its anchor rather than only reading what
+    /// `codesign -dv` displays. Older Spectras leave it out; the evidence says it then.
+    pub validated: Option<bool>,
+}
+
+/// A signature as the list shows it: what it claims and whether that was checked. Orders least
+/// trusted first, so a group's is its worst member's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Trust {
+    Invalid,
+    Unsigned,
+    Adhoc,
+    #[default]
+    Unknown,
+    /// Claims Developer ID or Apple, as displayed; nobody checked it.
+    Unverified(SignStatus),
+    /// Checked against its anchor.
+    Verified(SignStatus),
+}
+
+impl Trust {
+    pub fn label(self) -> String {
+        match self {
+            Trust::Invalid => "Invalid".into(),
+            Trust::Unsigned => "Unsigned".into(),
+            Trust::Adhoc => "Ad hoc".into(),
+            Trust::Unknown => "Unknown".into(),
+            Trust::Unverified(s) => format!("{} · not verified", s.label()),
+            Trust::Verified(s) => s.label().into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -223,22 +259,73 @@ pub struct Process {
     pub app: Option<AppInfo>,
     pub signing: Option<Signing>,
     pub evidence: Vec<String>,
+    /// Nanoseconds it had been running at the reading.
+    pub elapsed: Option<i64>,
+}
+
+/// Whether the `signing:` evidence line says the signature was checked. Spectra writes
+/// "validated by codesign --verify" for a checked one and "not validated" otherwise.
+fn evidence_validated(evidence: &[String]) -> bool {
+    evidence
+        .iter()
+        .find(|l| l.starts_with("signing:"))
+        .is_some_and(|l| l.contains(" validated by ") && !l.contains("not validated"))
 }
 
 impl Process {
     /// The short name: its command, else its executable's file name.
-    pub fn name(&self) -> String {
+    pub fn name(&self) -> Cow<'_, str> {
         if !self.command.is_empty() {
-            return self.command.clone();
+            return Cow::Borrowed(&self.command);
         }
         match self.executable_path.rsplit('/').find(|p| !p.is_empty()) {
-            Some(n) => n.to_owned(),
-            None => format!("pid {}", self.pid),
+            Some(n) => Cow::Borrowed(n),
+            None => Cow::Owned(format!("pid {}", self.pid)),
         }
     }
 
     pub fn sign_status(&self) -> SignStatus {
         self.signing.as_ref().map_or(SignStatus::Unknown, |s| s.status)
+    }
+
+    /// Whether its signature was checked: Spectra's `validated` when it sends one, else what
+    /// the evidence says, else not.
+    pub fn validated(&self) -> bool {
+        self.signing
+            .as_ref()
+            .is_some_and(|s| s.validated.unwrap_or_else(|| evidence_validated(&self.evidence)))
+    }
+
+    /// Settles what can be worked out once per reading, so the list doesn't redo it per row.
+    pub fn settle(&mut self) {
+        let validated = evidence_validated(&self.evidence);
+        if let Some(s) = &mut self.signing {
+            s.validated.get_or_insert(validated);
+        }
+    }
+
+    pub fn trust(&self) -> Trust {
+        match self.sign_status() {
+            SignStatus::Invalid => Trust::Invalid,
+            SignStatus::Unsigned => Trust::Unsigned,
+            SignStatus::Adhoc => Trust::Adhoc,
+            SignStatus::Unknown => Trust::Unknown,
+            s if self.validated() => Trust::Verified(s),
+            s => Trust::Unverified(s),
+        }
+    }
+
+    /// The `signing:` line of its evidence, if Spectra gave one.
+    pub fn signing_evidence(&self) -> Option<&str> {
+        self.evidence.iter().find(|l| l.starts_with("signing:")).map(String::as_str)
+    }
+
+    /// Seconds it had been running at `now` (Unix seconds), from `started_at`, else from the
+    /// reading's `elapsed`. `None` when neither says.
+    pub fn age_secs(&self, now: i64) -> Option<i64> {
+        parse_rfc3339(&self.started_at)
+            .map(|t| now - t)
+            .or_else(|| self.elapsed.filter(|e| *e > 0).map(|e| e / 1_000_000_000))
     }
 
     pub fn bundle_path(&self) -> Option<&str> {
@@ -257,6 +344,46 @@ impl Process {
     pub fn sample(&self) -> ProcSample {
         ProcSample { cpu: self.cpu_pct, rss_kib: self.rss_kib }
     }
+}
+
+/// `2026-11-19T19:28:38-05:00` (or `Z`) as Unix seconds.
+pub fn parse_rfc3339(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || !matches!(b[10], b'T' | b't' | b' ') || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, mi, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    // Skip fractional seconds.
+    let mut i = 19;
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        while b.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+    }
+    let offset = match b.get(i)? {
+        b'Z' | b'z' => 0,
+        sign @ (b'+' | b'-') => {
+            let (oh, om) = (num(i + 1..i + 3)?, num(i + 4..i + 6)?);
+            let o = oh * 3600 + om * 60;
+            if *sign == b'-' { -o } else { o }
+        }
+        _ => return None,
+    };
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return None;
+    }
+    // Days from 1970-01-01 to y-mo-d (Howard Hinnant's days_from_civil).
+    let y = if mo <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (mo + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + h * 3600 + mi * 60 + sec - offset)
 }
 
 /// One reading of a process, kept in its history.
@@ -284,7 +411,14 @@ pub fn parse(json: &str) -> ProcFeed {
         return Err(ProcError::TooOld("Spectra listed processes without classifying them.".into()));
     }
     let mut procs: Vec<Process> = raw.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect();
+    // Every machine runs something; an empty list means the reading went wrong.
+    if procs.is_empty() {
+        return Err(ProcError::Failed("Spectra listed no processes.".into()));
+    }
     procs.sort_by_key(|p| p.pid);
+    for p in &mut procs {
+        p.settle();
+    }
     Ok(procs)
 }
 
@@ -299,30 +433,50 @@ pub fn classify_failure(bin: &str, stderr: &str) -> ProcError {
     }
 }
 
+/// How long a reading may take before it's stopped. A cold classification takes about 20 s.
+pub const DEADLINE: Duration = Duration::from_secs(30);
+/// The most a reading may print; a busy machine's is a few MB.
+pub const MAX_OUTPUT: usize = 64 << 20;
+
+/// What a run that didn't finish means, for `bin`.
+pub fn run_failure(bin: &str, e: RunError) -> String {
+    match e {
+        RunError::Spawn(e) => format!("Couldn't run {bin}: {e}. Install Spectra or set SPECTRA_BIN."),
+        RunError::Timeout(d) => format!("{bin} took longer than {} s and was stopped", d.as_secs_f64().round()),
+        RunError::TooLarge(cap) => format!("{bin} printed more than {} MB and was stopped", cap >> 20),
+        RunError::Io(e) => format!("Couldn't read {bin}'s output: {e}"),
+    }
+}
+
 /// Runs `spectra process -json --classify`. Call it off the UI thread.
 pub fn fetch() -> ProcFeed {
     let bin = std::env::var("SPECTRA_BIN").unwrap_or_else(|_| "spectra".into());
-    let out = Command::new(&bin)
-        .args(["process", "-json", "--classify"])
-        .output()
-        .map_err(|e| ProcError::Failed(format!("Couldn't run {bin}: {e}. Install Spectra or set SPECTRA_BIN.")))?;
+    fetch_from(&bin, DEADLINE)
+}
+
+/// [`fetch`] from `bin`, stopping it after `deadline`.
+pub fn fetch_from(bin: &str, deadline: Duration) -> ProcFeed {
+    let mut cmd = Command::new(bin);
+    cmd.args(["process", "-json", "--classify"]);
+    let out = run::run(cmd, deadline, MAX_OUTPUT).map_err(|e| ProcError::Failed(run_failure(bin, e)))?;
     if !out.status.success() {
-        return Err(classify_failure(&bin, &String::from_utf8_lossy(&out.stderr)));
+        return Err(classify_failure(bin, &String::from_utf8_lossy(&out.stderr)));
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     // Go's flag package prints usage to stderr but can exit 0; an empty stdout then is the tell.
     if stdout.trim().is_empty() {
-        return Err(classify_failure(&bin, &String::from_utf8_lossy(&out.stderr)));
+        return Err(classify_failure(bin, &String::from_utf8_lossy(&out.stderr)));
     }
     parse(&stdout)
 }
 
-/// Memory, from KiB: one decimal under 10 MB, whole MB below a GB, then GB.
+/// Memory, from KiB: one decimal under 10 MB, whole MB below a GB, then GB. The thresholds are
+/// where the rounded figure would reach the next unit, so 1023.96 MB reads 1.0 GB, not 1024 MB.
 pub fn fmt_mem(kib: f64) -> String {
     let mb = kib / 1024.0;
-    if mb >= 1024.0 {
+    if mb >= 1023.5 {
         format!("{:.1} GB", mb / 1024.0)
-    } else if mb >= 10.0 {
+    } else if mb >= 9.95 {
         format!("{mb:.0} MB")
     } else {
         format!("{mb:.1} MB")
@@ -338,7 +492,7 @@ pub fn fmt_count(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::new();
     for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
@@ -404,7 +558,78 @@ mod tests {
         assert!(matches!(err, ProcError::TooOld(_)));
         assert!(matches!(classify_failure("spectra", "permission denied"), ProcError::Failed(_)));
         assert!(matches!(parse(r#"[{"pid":1,"command":"launchd"}]"#), Err(ProcError::TooOld(_))));
-        assert_eq!(parse("[]").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn an_empty_list_is_a_failed_reading() {
+        assert!(matches!(parse("[]"), Err(ProcError::Failed(_))));
+        assert!(matches!(parse(r#"[{"pid":"x","role":"cli"}]"#), Err(ProcError::Failed(_))), "nothing parsed");
+    }
+
+    /// The real feed's `signing:` lines, team ids changed.
+    const DEV_ID: &str = "signing: developer_id, team ABCDE12345 as displayed by codesign -dv, not validated; verdict is for the file on disk";
+    const APPLE: &str = r#"signing: platform binary validated by codesign --verify --ignore-resources -R="anchor apple"; verdict is for the file on disk"#;
+
+    #[test]
+    fn a_signature_is_verified_only_when_spectra_checked_it() {
+        let feed = format!(
+            r#"[{{"pid":1,"role":"system","signing":{{"status":"apple"}},"evidence":[{APPLE:?}]}},
+               {{"pid":2,"role":"app","signing":{{"status":"developer_id","team_id":"ABCDE12345"}},"evidence":[{DEV_ID:?}]}},
+               {{"pid":3,"role":"cli","signing":{{"status":"developer_id"}}}},
+               {{"pid":4,"role":"cli","signing":{{"status":"developer_id","validated":true}},"evidence":[{DEV_ID:?}]}},
+               {{"pid":5,"role":"cli","signing":{{"status":"apple","validated":false}},"evidence":[{APPLE:?}]}}]"#
+        );
+        let p = parse(&feed).unwrap();
+        let trust: Vec<Trust> = p.iter().map(Process::trust).collect();
+        assert_eq!(
+            trust,
+            [
+                Trust::Verified(SignStatus::Apple),
+                Trust::Unverified(SignStatus::DeveloperId),
+                Trust::Unverified(SignStatus::DeveloperId),
+                Trust::Verified(SignStatus::DeveloperId),
+                Trust::Unverified(SignStatus::Apple),
+            ],
+            "evidence decides unless Spectra says; no word is not verified"
+        );
+        assert_eq!(trust[1].label(), "Developer ID · not verified");
+        assert_eq!(trust[0].label(), "Apple");
+        assert_eq!(p[1].signing_evidence(), Some(DEV_ID));
+        // Least trusted first: an unverified Developer ID sits below every verified one.
+        let mut all = trust.clone();
+        all.extend([Trust::Adhoc, Trust::Invalid, Trust::Unknown]);
+        all.sort();
+        assert_eq!(&all[..4], [Trust::Invalid, Trust::Adhoc, Trust::Unknown, Trust::Unverified(SignStatus::DeveloperId)]);
+        assert_eq!(all.last(), Some(&Trust::Verified(SignStatus::Apple)));
+    }
+
+    #[test]
+    fn reads_start_times_and_ages() {
+        assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_rfc3339("2026-11-19T19:28:38-05:00"), Some(1_795_134_518));
+        assert_eq!(parse_rfc3339("2026-11-20T00:28:38.123+00:00"), Some(1_795_134_518));
+        assert_eq!(parse_rfc3339("yesterday"), None);
+        let mut p = Process { started_at: "2026-11-19T19:28:38-05:00".into(), ..Process::default() };
+        assert_eq!(p.age_secs(1_795_134_518 + 90), Some(90));
+        p.started_at.clear();
+        p.elapsed = Some(201_000_000_000);
+        assert_eq!(p.age_secs(0), Some(201), "the reading's elapsed when there's no start time");
+        p.elapsed = None;
+        assert_eq!(p.age_secs(0), None);
+    }
+
+    #[test]
+    fn a_hung_spectra_is_stopped_and_reported() {
+        let bin = crate::run::tests::script("hung-process", "exec sleep 60");
+        let err = fetch_from(bin.to_str().unwrap(), Duration::from_millis(200)).unwrap_err();
+        let ProcError::Failed(why) = err else { panic!("{err:?}") };
+        assert!(why.contains("took longer than") && why.contains("was stopped"), "{why}");
+    }
+
+    #[test]
+    fn a_spectra_that_lists_nothing_has_failed() {
+        let bin = crate::run::tests::script("empty-process", "echo '[]'");
+        assert!(matches!(fetch_from(bin.to_str().unwrap(), DEADLINE), Err(ProcError::Failed(_))));
     }
 
     #[test]
@@ -412,6 +637,9 @@ mod tests {
         assert_eq!(fmt_mem(736.0), "0.7 MB");
         assert_eq!(fmt_mem(272_464.0), "266 MB");
         assert_eq!(fmt_mem(8_622_592.0), "8.2 GB");
+        assert_eq!(fmt_mem(1023.96 * 1024.0), "1.0 GB", "rounds up into GB, never 1024 MB");
+        assert_eq!(fmt_mem(1023.4 * 1024.0), "1023 MB");
+        assert_eq!(fmt_mem(9.97 * 1024.0), "10 MB");
         assert_eq!(fmt_cpu(211.64), "211.6%");
         assert_eq!(fmt_cpu(0.0), "0.0%");
         assert_eq!(fmt_count(1971), "1,971");
@@ -442,8 +670,13 @@ mod tests {
         for st in [SignStatus::Apple, SignStatus::DeveloperId, SignStatus::Adhoc, SignStatus::Unsigned, SignStatus::Invalid, SignStatus::Unknown] {
             println!("  signing {:<12} {}", st.label(), count(&|p| p.sign_status() == st));
         }
+        let validated = procs.iter().filter(|p| p.validated()).count();
+        println!("  {validated} signatures verified, {} not", procs.iter().filter(|p| p.signing.is_some()).count() - validated);
         let groups = crate::groups::group(&procs.iter().collect::<Vec<_>>(), crate::groups::Sort::default());
         println!("{} groups, {} of them apps", groups.len(), groups.iter().filter(|g| g.kind == crate::groups::GroupKind::App).count());
+        for g in groups.iter().filter(|g| g.hint.is_some()).take(8) {
+            println!("  same name, told apart: {} [{}] ({} processes)", g.name, g.hint.as_deref().unwrap_or(""), g.pids.len());
+        }
         assert!(!procs.is_empty());
     }
 }

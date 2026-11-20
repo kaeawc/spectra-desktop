@@ -5,9 +5,8 @@ use rune_kit::Kit;
 
 use super::card::{card, notice};
 use crate::app::App;
-use crate::findings::Finding;
 use crate::groups::Category;
-use crate::procs::{ProcError, Role, fmt_count, fmt_mem};
+use crate::procs::{ProcError, fmt_count, fmt_mem};
 
 /// A boxed message that sits above other content.
 pub fn callout(key: &str, title: &str, body: &str, k: &Kit) -> El {
@@ -83,15 +82,7 @@ fn tile(key: &str, label: &str, value: String, note: String, k: &Kit) -> El {
 /// The categories holding the most memory, each with a bar against the largest.
 fn memory_by_kind(s: &App, k: &Kit) -> El {
     let c = &k.c;
-    let mut by_kind: Vec<(Category, f64)> = Category::ALL
-        .iter()
-        .map(|&cat| {
-            let kib = s.procs.iter().filter(|p| cat.holds(p.role)).map(|p| p.rss_kib).sum();
-            (cat, kib)
-        })
-        .filter(|(_, kib)| *kib > 0.0)
-        .collect();
-    by_kind.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let by_kind: &[(Category, f64)] = &s.stats.memory;
     let top = by_kind.first().map_or(1.0, |t| t.1).max(1.0);
     let figures = k.ty.small.features("'tnum' 1");
     by_kind.iter().take(3).fold(
@@ -137,8 +128,7 @@ fn memory_by_kind(s: &App, k: &Kit) -> El {
 
 /// Process count, CPU in use, and where the memory goes.
 fn summary(s: &App, k: &Kit) -> El {
-    let cpu: f64 = s.procs.iter().map(|p| p.cpu_pct).sum();
-    let apps = s.procs.iter().filter(|p| p.role == Role::App).count();
+    let (cpu, apps) = (s.stats.cpu, s.stats.apps);
     row()
         .key("summary")
         .w_full()
@@ -161,13 +151,33 @@ fn summary(s: &App, k: &Kit) -> El {
         .child(memory_by_kind(s, k))
 }
 
-pub fn home(s: &App, findings: &[Finding], k: &Kit) -> El {
+/// When the numbers are from, in a plain line, once they're old or the last reading failed.
+pub fn feed_status(s: &App, k: &Kit) -> Option<El> {
+    let status = s.feed_status()?;
+    Some(
+        text(status.clone())
+            .key("feed-status")
+            .role("status")
+            .font(k.ty.small)
+            .color(k.c.text_muted)
+            .truncate()
+            .shrink()
+            .min_w(0.0)
+            .help_when_truncated(status),
+    )
+}
+
+pub fn home(s: &App, k: &Kit) -> El {
     let c = &k.c;
+    let findings = &s.findings;
     let mut list = col().key("findings").w_full().padding(24.0).gap(10.0);
     if let Some(n) = feed_notice(s, k) {
         list = list.child(n);
     }
     if s.has_processes() {
+        if let Some(status) = feed_status(s, k) {
+            list = list.child(status);
+        }
         list = list.child(summary(s, k)).child(
             text("Findings")
                 .key("findings-title")

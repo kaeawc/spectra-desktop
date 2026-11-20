@@ -8,7 +8,7 @@ use super::card::{card, delta, dot, ink};
 use super::chart::{fmt_secs, timeline};
 use crate::app::App;
 use crate::data::{Jvm, Sample, fmt_kib};
-use crate::findings::Severity;
+use crate::findings::{Finding, Severity};
 
 const TILE_W: f32 = 160.0;
 
@@ -24,7 +24,7 @@ pub fn detail(s: &App, j: &Jvm, k: &Kit) -> El {
         .w_full()
         .padding(24.0)
         .gap(24.0)
-        .child(header(s, j, k))
+        .child(header(j, findings.first().copied(), k))
         .child(tiles(s, j, k))
         .child(section(
             "Timeline",
@@ -84,11 +84,10 @@ pub fn section(title: &str, body: El, k: &Kit) -> El {
         .child(body)
 }
 
-fn header(s: &App, j: &Jvm, k: &Kit) -> El {
+fn header(j: &Jvm, worst: Option<&Finding>, k: &Kit) -> El {
     let c = &k.c;
-    let worst = s.findings_for(j.pid).into_iter().next();
-    let severity = worst.as_ref().map_or(Severity::Healthy, |f| f.severity);
-    let verdict = worst.map_or_else(|| "Healthy".to_owned(), |f| f.title);
+    let severity = worst.map_or(Severity::Healthy, |f| f.severity);
+    let verdict = worst.map_or_else(|| "Healthy".to_owned(), |f| f.title.clone());
     let jdk = jdk(j);
     col()
         .key("jd-header")
@@ -121,15 +120,9 @@ fn header(s: &App, j: &Jvm, k: &Kit) -> El {
         )
 }
 
+/// A count that may be a negative delta, with thousands separators.
 fn fmt_count(n: f64) -> String {
-    let digits = format!("{:.0}", n.abs());
-    let mut out = String::new();
-    for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(ch);
-    }
+    let out = crate::procs::fmt_count(n.abs().round() as u64);
     if n < 0.0 { format!("-{out}") } else { out }
 }
 

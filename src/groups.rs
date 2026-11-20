@@ -2,10 +2,11 @@
 //! keep, how they gather into rows a person recognises (an app with its helpers, twelve zsh),
 //! and a sort that keeps rows still when values tie.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
-use crate::procs::{Process, Role, Runtime, SignStatus};
+use crate::procs::{Process, Role, Runtime, Trust};
 
 /// The sidebar's categories, by what a process is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -141,6 +142,7 @@ impl Sort {
     }
 
     pub fn processes(self, a: &Process, b: &Process) -> Ordering {
+        // `name` borrows unless a process has neither command nor path.
         let (na, nb) = (a.name(), b.name());
         self.order((a.cpu_pct, a.rss_kib, &na, ""), (b.cpu_pct, b.rss_kib, &nb, ""))
             .then(a.pid.cmp(&b.pid))
@@ -168,7 +170,7 @@ fn caseless(a: &str, b: &str) -> Ordering {
 pub enum GroupKind {
     /// An app bundle and its helpers.
     App,
-    /// Several processes running the same executable.
+    /// Several processes of one name running the same executable.
     Exe,
     /// One process on its own.
     Single,
@@ -190,32 +192,83 @@ pub struct Group {
     pub threads: u64,
     pub role: Role,
     pub runtime: Runtime,
-    /// The worst signature among the members.
-    pub signing: SignStatus,
+    /// The least trusted signature among the members.
+    pub signing: Trust,
+    /// Where it runs from, dimmed beside the name, when another row has the same name: the
+    /// nearest folder in its executable's path that tells them apart.
+    pub hint: Option<String>,
+    /// The lead's executable, to tell same-named rows apart.
+    pub path: String,
 }
 
 fn key_safe(s: &str) -> String {
     s.replace('/', ":")
 }
 
+/// A non-app process's executable and name: two `java` from different JDKs are different
+/// programs, and so are `bash` and the `deploy.sh` it runs.
+fn exe_key(p: &Process) -> (&str, Cow<'_, str>) {
+    (p.executable_path.as_str(), p.name())
+}
+
+/// The nearest folder of `path` (counting up from the executable) that appears nowhere in
+/// `others`: `temurin-21.jdk` against `zulu-17.jdk`, `iOS 26.5.simruntime` against another
+/// simulator. When there's none, or it says nothing on its own (`Versions/A`'s `A`), the whole
+/// folder: `/usr/libexec` against a simulator's copy.
+pub fn distinguishing_folder(path: &str, others: &[&str]) -> Option<String> {
+    let (dir, _) = path.rsplit_once('/')?;
+    let theirs: HashSet<&str> = others.iter().flat_map(|o| o.split('/')).collect();
+    let unique = dir.rsplit('/').filter(|c| !c.is_empty()).find(|c| !theirs.contains(c));
+    Some(match unique {
+        Some(c) if c.chars().count() > 2 => c.to_owned(),
+        _ if dir.is_empty() => "/".to_owned(),
+        _ => dir.to_owned(),
+    })
+}
+
+/// Gives each non-app group whose name another group shares the folder that tells it apart.
+fn add_hints(groups: &mut [Group]) {
+    let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, g) in groups.iter().enumerate().filter(|(_, g)| g.kind != GroupKind::App) {
+        by_name.entry(g.name.as_str()).or_default().push(i);
+    }
+    let hints: Vec<(usize, Option<String>)> = by_name
+        .values()
+        .filter(|ix| ix.len() > 1)
+        .flat_map(|ix| {
+            ix.iter().map(|&i| {
+                let others: Vec<&str> = ix.iter().filter(|&&j| j != i).map(|&j| groups[j].path.as_str()).collect();
+                (i, distinguishing_folder(&groups[i].path, &others))
+            })
+        })
+        .collect();
+    for (i, h) in hints {
+        groups[i].hint = Some(h.unwrap_or_else(|| "path unknown".to_owned()));
+    }
+}
+
 /// Gathers `procs` into groups, sorted by `sort`, members too.
 pub fn group(procs: &[&Process], sort: Sort) -> Vec<Group> {
-    let mut by_name: HashMap<String, usize> = HashMap::new();
+    let mut by_exe: HashMap<(&str, Cow<'_, str>), usize> = HashMap::new();
     for p in procs.iter().filter(|p| p.bundle_path().is_none()) {
-        *by_name.entry(p.name()).or_default() += 1;
+        *by_exe.entry(exe_key(p)).or_default() += 1;
     }
     let mut order: Vec<String> = Vec::new();
     let mut members: HashMap<String, (GroupKind, String, Vec<&Process>)> = HashMap::new();
     for p in procs {
         let (id, kind, name) = match (&p.app, p.bundle_path()) {
             (Some(app), Some(path)) => {
-                let name = if app.name.is_empty() { p.name() } else { app.name.clone() };
+                let name = if app.name.is_empty() { p.name().into_owned() } else { app.name.clone() };
                 (format!("app:{}", key_safe(path)), GroupKind::App, name)
             }
-            _ if by_name.get(&p.name()).copied().unwrap_or(0) > 1 => {
-                (format!("exe:{}", key_safe(&p.name())), GroupKind::Exe, p.name())
+            _ if by_exe.get(&exe_key(p)).copied().unwrap_or(0) > 1 => {
+                let id = match p.executable_path.as_str() {
+                    "" => format!("exe:{}", key_safe(&p.name())),
+                    path => format!("exe:{}@{}", key_safe(&p.name()), key_safe(path)),
+                };
+                (id, GroupKind::Exe, p.name().into_owned())
             }
-            _ => (format!("pid:{}", p.pid), GroupKind::Single, p.name()),
+            _ => (format!("pid:{}", p.pid), GroupKind::Single, p.name().into_owned()),
         };
         members
             .entry(id.clone())
@@ -237,22 +290,24 @@ pub fn group(procs: &[&Process], sort: Sort) -> Vec<Group> {
                 .min_by_key(|p| p.pid)
                 .or_else(|| ps.iter().min_by_key(|p| p.pid))
                 .copied();
-            let lead_p = lead.cloned().unwrap_or_default();
             Group {
                 id,
                 name,
                 kind,
                 pids: ps.iter().map(|p| p.pid).collect(),
-                lead: lead_p.pid,
+                lead: lead.map_or(0, |p| p.pid),
                 cpu: ps.iter().map(|p| p.cpu_pct).sum(),
                 rss_kib: ps.iter().map(|p| p.rss_kib).sum(),
                 threads: ps.iter().map(|p| p.thread_count).sum(),
-                role: lead_p.role,
-                runtime: lead_p.runtime,
-                signing: ps.iter().map(|p| p.sign_status()).min().unwrap_or_default(),
+                role: lead.map_or_else(Role::default, |p| p.role),
+                runtime: lead.map_or_else(Runtime::default, |p| p.runtime),
+                signing: ps.iter().map(|p| p.trust()).min().unwrap_or_default(),
+                hint: None,
+                path: lead.map_or_else(String::new, |p| p.executable_path.clone()),
             }
         })
         .collect();
+    add_hints(&mut groups);
     groups.sort_by(|a, b| sort.groups(a, b));
     groups
 }
@@ -271,6 +326,8 @@ pub struct Row {
     pub id: String,
     pub depth: u8,
     pub item: RowRef,
+    /// The group it is or belongs to, an index into the groups.
+    pub group: usize,
 }
 
 /// The rows on screen: each group, followed by its members when it's open. A group of one is
@@ -279,12 +336,12 @@ pub fn flatten(groups: &[Group], open: &HashSet<String>) -> Vec<Row> {
     let mut rows = Vec::with_capacity(groups.len());
     for (i, g) in groups.iter().enumerate() {
         if g.kind == GroupKind::Single || g.pids.len() == 1 {
-            rows.push(Row { id: format!("p:{}", g.pids[0]), depth: 0, item: RowRef::Process(g.pids[0]) });
+            rows.push(Row { id: format!("p:{}", g.pids[0]), depth: 0, item: RowRef::Process(g.pids[0]), group: i });
             continue;
         }
-        rows.push(Row { id: format!("g:{}", g.id), depth: 0, item: RowRef::Group(i) });
+        rows.push(Row { id: format!("g:{}", g.id), depth: 0, item: RowRef::Group(i), group: i });
         if open.contains(&g.id) {
-            rows.extend(g.pids.iter().map(|&pid| Row { id: format!("p:{pid}"), depth: 1, item: RowRef::Process(pid) }));
+            rows.extend(g.pids.iter().map(|&pid| Row { id: format!("p:{pid}"), depth: 1, item: RowRef::Process(pid), group: i }));
         }
     }
     rows
@@ -293,7 +350,7 @@ pub fn flatten(groups: &[Group], open: &HashSet<String>) -> Vec<Row> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::procs::{AppInfo, Signing};
+    use crate::procs::{AppInfo, SignStatus, Signing};
 
     pub fn proc(pid: u32, name: &str, cpu: f64, rss_kib: f64) -> Process {
         Process {
@@ -343,8 +400,75 @@ pub(crate) mod tests {
         assert_eq!(slack.lead, 10, "the app itself, not a helper");
         assert_eq!(slack.cpu, 8.0);
         assert_eq!(slack.rss_kib, 600_000.0);
-        assert_eq!(slack.signing, SignStatus::Adhoc, "the worst member's signature");
+        assert_eq!(slack.signing, Trust::Adhoc, "the worst member's signature");
         assert!(!slack.id.contains('/'));
+    }
+
+    #[test]
+    fn an_unverified_member_makes_the_group_unverified() {
+        let mut v = sample();
+        v[1].signing = Some(Signing { status: SignStatus::Apple, validated: Some(true), ..Signing::default() });
+        v[2].signing = Some(Signing { status: SignStatus::Apple, validated: Some(true), ..Signing::default() });
+        let g = group(&refs(&v), Sort::default());
+        assert_eq!(g[0].signing, Trust::Unverified(SignStatus::DeveloperId));
+        v[0].signing.as_mut().unwrap().validated = Some(true);
+        let g = group(&refs(&v), Sort::default());
+        assert_eq!(g[0].signing, Trust::Verified(SignStatus::DeveloperId));
+    }
+
+    fn at(mut p: Process, path: &str) -> Process {
+        p.executable_path = path.into();
+        p
+    }
+
+    #[test]
+    fn same_named_programs_at_different_paths_are_separate_rows() {
+        const TEMURIN: &str = "/Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home/bin/java";
+        const ZULU: &str = "/Library/Java/JavaVirtualMachines/zulu-17.jdk/Contents/Home/bin/java";
+        const SIM: &str = "/Library/Developer/CoreSimulator/Volumes/iOS_22A/System/Library/PrivateFrameworks/Sharing.framework/sharingd";
+        let v = vec![
+            at(proc(1, "java", 0.0, 1.0), TEMURIN),
+            at(proc(2, "java", 0.0, 1.0), TEMURIN),
+            at(proc(3, "java", 0.0, 1.0), ZULU),
+            at(proc(4, "sharingd", 0.0, 1.0), "/usr/libexec/sharingd"),
+            at(proc(5, "sharingd", 0.0, 1.0), SIM),
+            at(proc(6, "bash", 0.0, 1.0), "/bin/bash"),
+            at(proc(7, "deploy.sh", 0.0, 1.0), "/bin/bash"),
+            at(proc(8, "gh", 0.0, 1.0), "/opt/homebrew/bin/gh"),
+        ];
+        let g = group(&refs(&v), Sort { key: SortKey::Name, descending: false });
+        let rows: Vec<(&str, Vec<u32>, Option<&str>)> = g.iter().map(|g| (g.name.as_str(), g.pids.clone(), g.hint.as_deref())).collect();
+        assert_eq!(
+            rows,
+            [
+                ("bash", vec![6], None),
+                ("deploy.sh", vec![7], None),
+                ("gh", vec![8], None),
+                ("java", vec![1, 2], Some("temurin-21.jdk")),
+                ("java", vec![3], Some("zulu-17.jdk")),
+                ("sharingd", vec![4], Some("libexec")),
+                ("sharingd", vec![5], Some("Sharing.framework")),
+            ]
+        );
+        assert_eq!(g[3].kind, GroupKind::Exe);
+        assert!(!g[3].id.contains('/'));
+        assert_ne!(g[3].id, g[4].id);
+        assert_eq!(distinguishing_folder("/a/b/x", &["/a/b/x"]).as_deref(), Some("/a/b"), "identical paths: the whole folder");
+        // Seen in a real feed: the host's copy and two simulators'.
+        const SIM_A: &str = "/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 26.5.simruntime/Contents/Resources/RuntimeRoot/usr/libexec/runningboardd";
+        const SIM_B: &str = "/private/var/run/mnt/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 27.2.simruntime/Contents/Resources/RuntimeRoot/usr/libexec/runningboardd";
+        const HOST: &str = "/usr/libexec/runningboardd";
+        assert_eq!(distinguishing_folder(SIM_A, &[SIM_B, HOST]).as_deref(), Some("iOS 26.5.simruntime"));
+        assert_eq!(distinguishing_folder(HOST, &[SIM_A, SIM_B]).as_deref(), Some("/usr/libexec"));
+        const MA: &str = "/System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd";
+        const MA_SIM: &str = "/Sim/RuntimeRoot/System/Library/PrivateFrameworks/MediaAnalysis.framework/mediaanalysisd";
+        assert_eq!(
+            distinguishing_folder(MA, &[MA_SIM]).as_deref(),
+            Some("/System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A"),
+            "`A` on its own says nothing"
+        );
+        assert_eq!(distinguishing_folder(MA_SIM, &[MA]).as_deref(), Some("RuntimeRoot"));
+        assert_eq!(distinguishing_folder("", &[MA]), None);
     }
 
     #[test]

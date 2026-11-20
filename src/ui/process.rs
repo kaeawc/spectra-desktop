@@ -9,7 +9,7 @@ use super::chart::{Lane, Mark, lanes};
 use super::detail::{jvm_part, section};
 use super::list::sign_badge;
 use crate::app::App;
-use crate::findings::Severity;
+use crate::findings::{Finding, Severity};
 use crate::procs::{Process, fmt_count, fmt_cpu, fmt_mem};
 
 const LABEL_W: f32 = 120.0;
@@ -25,7 +25,7 @@ pub fn page(s: &App, p: &Process, k: &Kit) -> El {
         .w_full()
         .padding(24.0)
         .gap(24.0)
-        .child(header(s, p, k));
+        .child(header(s, p, findings.first().copied(), k));
     if !findings.is_empty() {
         let list = findings
             .iter()
@@ -52,15 +52,14 @@ pub fn page(s: &App, p: &Process, k: &Kit) -> El {
         .child(section("How Spectra recognised it", evidence(p, k), k))
 }
 
-fn header(s: &App, p: &Process, k: &Kit) -> El {
+fn header(s: &App, p: &Process, worst: Option<&Finding>, k: &Kit) -> El {
     let c = &k.c;
-    let worst = s.findings_for(p.pid).into_iter().next();
-    let severity = worst.as_ref().map_or(Severity::Healthy, |f| f.severity);
-    let verdict = worst.map_or_else(|| "Nothing unusual".to_owned(), |f| f.title);
+    let severity = worst.map_or(Severity::Healthy, |f| f.severity);
+    let verdict = worst.map_or_else(|| "Nothing unusual".to_owned(), |f| f.title.clone());
     // A JVM is better known by what it runs than by `java`.
     let (name, runs) = match s.jvm(p.pid) {
         Some(j) => (j.name(), format!("{} · ", p.name())),
-        None => (p.name(), String::new()),
+        None => (p.name().into_owned(), String::new()),
     };
     let meta = format!(
         "{runs}pid {} · {} CPU · {} · {} threads",
@@ -135,7 +134,7 @@ fn facts(s: &App, p: &Process, k: &Kit) -> El {
             .cursor(Cursor::Pointer)
             .font(k.ty.small)
             .color(c.text_accent)
-            .on_press(move |s: &mut App| s.select(Some(ppid))),
+            .on_press(move |s: &mut App| s.open(ppid)),
         None if ppid == 0 => value("None: started by the kernel", k),
         None => value(format!("pid {ppid}, no longer running"), k),
     };
@@ -173,20 +172,49 @@ fn facts(s: &App, p: &Process, k: &Kit) -> El {
             .child(fact("bundle-id", "Bundle id", value(or_unknown(&app.bundle_id), k), k))
             .child(fact("bundle", "Bundle", value(or_unknown(&app.bundle_path), k), k));
     }
-    let signing = match &p.signing {
-        Some(sg) => {
-            let team = if sg.team_id.is_empty() { "no team".to_owned() } else { format!("team {}", sg.team_id) };
-            let hardened = if sg.hardened_runtime { "hardened runtime on" } else { "hardened runtime off" };
-            row()
-                .gap(8.0)
-                .center_y()
-                .flex_wrap()
-                .child(sign_badge(sg.status, k))
-                .child(text(format!("{team} · {hardened}")).key("pd-signing").font(k.ty.small).color(c.text_base))
-        }
-        None => value("Not read", k),
+    list.child(fact("signing", "Signature", signing(p, k), k))
+}
+
+/// The signature's claim, its team and hardened runtime, and Spectra's own words on how it
+/// knows. Unless Spectra checked it, the team is only what `codesign` displayed.
+fn signing(p: &Process, k: &Kit) -> El {
+    let c = &k.c;
+    let Some(sg) = &p.signing else {
+        return value("Not read", k);
     };
-    list.child(fact("signing", "Signature", signing, k))
+    let checked = p.validated();
+    let team = match (sg.team_id.is_empty(), checked) {
+        (true, _) => "no team".to_owned(),
+        (false, true) => format!("team {}", sg.team_id),
+        (false, false) => format!("team {} as displayed, not verified", sg.team_id),
+    };
+    let hardened = if sg.hardened_runtime { "hardened runtime on" } else { "hardened runtime off" };
+    let mut body = col().w_full().gap(4.0).child(
+        row()
+            .gap(8.0)
+            .center_y()
+            .flex_wrap()
+            .child(sign_badge(p.trust(), k))
+            .child(
+                text(format!("{team} · {hardened}"))
+                    .key("pd-signing")
+                    .font(k.ty.small)
+                    .color(c.text_base)
+                    .wrap(),
+            ),
+    );
+    if let Some(line) = p.signing_evidence() {
+        body = body.child(
+            text(line.to_owned())
+                .key("pd-signing-evidence")
+                .font(k.ty.small)
+                .color(c.text_muted)
+                .selectable(true)
+                .selection_color(k.selection())
+                .wrap_anywhere(),
+        );
+    }
+    body
 }
 
 fn activity(s: &App, p: &Process, k: &Kit) -> El {
@@ -234,9 +262,9 @@ fn children(kids: &[&Process], k: &Kit) -> El {
             .px(12.0)
             .gap(12.0)
             .center_y()
-            .on_press(move |s: &mut App| s.select(Some(pid)))
+            .on_press(move |s: &mut App| s.open(pid))
             .child(
-                text(p.name())
+                text(p.name().into_owned())
                     .font(k.ty.small)
                     .color(c.text_base)
                     .truncate()
