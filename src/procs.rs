@@ -334,15 +334,19 @@ impl Process {
 
     /// When it started, as `2026-11-19 19:28` in the time zone Spectra reported.
     pub fn started(&self) -> String {
-        let s = &self.started_at;
-        match (s.get(..10), s.get(11..16)) {
-            (Some(d), Some(t)) if s.as_bytes().get(10) == Some(&b'T') => format!("{d} {t}"),
-            _ => s.clone(),
-        }
+        fmt_start(&self.started_at)
     }
 
     pub fn sample(&self) -> ProcSample {
-        ProcSample { cpu: self.cpu_pct, rss_kib: self.rss_kib }
+        ProcSample { cpu: self.cpu_pct, rss_kib: self.rss_kib, threads: self.thread_count }
+    }
+}
+
+/// `2026-11-19T19:28:38-05:00` as `2026-11-19 19:28`, in the time zone it was given in.
+pub fn fmt_start(s: &str) -> String {
+    match (s.get(..10), s.get(11..16)) {
+        (Some(d), Some(t)) if s.as_bytes().get(10) == Some(&b'T') => format!("{d} {t}"),
+        _ => s.to_owned(),
     }
 }
 
@@ -391,6 +395,7 @@ pub fn parse_rfc3339(s: &str) -> Option<i64> {
 pub struct ProcSample {
     pub cpu: f64,
     pub rss_kib: f64,
+    pub threads: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]

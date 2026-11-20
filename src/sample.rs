@@ -8,6 +8,9 @@ use crate::findings::Finding;
 use crate::groups::{Category, Nav};
 use crate::procs::{AppInfo, ProcError, Process, Role, Runtime, SignStatus, Signing};
 use crate::signal::{self, Me, Signal, Target};
+use crate::inspect::{self, BundleState, RunState};
+use crate::live::NetPoint;
+use crate::tools::Tool;
 
 /// The app's own pid and user in the sample: not one of the sample's processes.
 pub const SAMPLE_ME: Me = Me { pid: 5000, uid: Some(501) };
@@ -21,7 +24,15 @@ fn sample_now() -> i64 {
     SAMPLE_NOW
 }
 
+/// The sample's pids are made up and may be real processes here: nothing runs on them, and no
+/// live reading or bundle read starts on its own.
+fn inert(s: &mut App) {
+    s.inspect.auto = false;
+    s.inspect.spectra = std::sync::Arc::new(inspect::Inert);
+}
+
 fn sample_jvms(s: &mut App) {
+    inert(s);
     // `young` is the leaking JVM's young collections so far: (count, seconds), so its GC and
     // thread lanes have something to show without changing what the findings say.
     let jvm = |pid, main: &str, args: &str, ou: f64, fgc, fgct, young: (u64, f64), threads| Jvm {
@@ -471,6 +482,7 @@ pub fn land_sample_procs(s: &mut App) {
     s.me = SAMPLE_ME;
     // The sample's pids are made up; they may be real processes on this machine.
     s.signals = std::sync::Arc::new(signal::Inert);
+    inert(s);
     for i in 0..PROC_READINGS {
         s.land_procs(Ok(all.iter().map(|x| process(x, i)).collect()));
     }
@@ -617,6 +629,171 @@ pub fn old_scene(s: &mut App) {
     s.expanded = s.findings.first().map(Finding::id);
 }
 
+/// Live readings as a page that has been open a couple of minutes has them.
+fn sample_live(s: &mut App) {
+    const WAVE: [f64; 12] = [1.0, 1.4, 0.8, 2.6, 1.1, 0.9, 3.2, 1.2, 0.7, 1.5, 2.1, 1.0];
+    for i in 0..24 {
+        let w = WAVE[i % 12];
+        s.inspect.net.push(NetPoint { in_bps: 180_000.0 * w, out_bps: 24_000.0 * WAVE[(i + 5) % 12] });
+        s.inspect.energy.push(4.0 + 3.0 * w);
+    }
+}
+
+/// `spectra --json /Applications/Slack.app`, as the sample has it.
+const SLACK_BUNDLE: &str = r#"[{"Path":"/Applications/Slack.app","UI":"Electron","Runtime":"Node+Chromium","Language":"TypeScript/JS",
+    "Confidence":"high","Signals":["Electron Framework.framework present"],"BundleID":"com.tinyspeck.slackmacgap",
+    "AppVersion":"4.47.72","BuildNumber":"447000072","FrameworkVersions":{"Electron":"39.2.7"},"Architectures":["arm64"],
+    "BundleSizeBytes":247373824,"TeamID":"BQR82RBBHL","MASReceipt":true,"HardenedRuntime":true,"Sandboxed":true,
+    "Entitlements":["app-sandbox","network.client","device.camera","device.microphone","files.downloads.read-write","print"],
+    "Storage":{"ApplicationSupport":0,"Caches":52428800,"Containers":1448222720,"GroupContainers":0,"HTTPStorages":0,"WebKit":0,"Logs":0,
+               "Preferences":0,"Total":1500651520,"Paths":["~/Library/Containers/com.tinyspeck.slackmacgap"]},
+    "Helpers":{"HelperApps":["Slack Helper","Slack Helper (GPU)","Slack Helper (Plugin)","Slack Helper (Renderer)"],"XPCServices":null,"Plugins":null},
+    "LoginItems":[{"Path":"/Library/LaunchAgents/com.tinyspeck.slackmacgap.updater.plist","Label":"com.tinyspeck.slackmacgap.updater",
+                   "Scope":"system","Daemon":false,"RunAtLoad":true,"KeepAlive":false}],
+    "GrantedPermissions":["Camera","Microphone","ScreenCapture","SystemPolicyDownloadsFolder"],
+    "GatekeeperStatus":"accepted","GatekeeperSource":"Mac App Store"}]"#;
+
+/// Slack's page: its processes together, live charts and its bundle.
+pub fn app_scene(s: &mut App) {
+    sample_scene(s);
+    s.expanded = None;
+    s.show(Nav::Category(Category::Apps));
+    s.open_app("/Applications/Slack.app");
+    sample_live(s);
+    let b = crate::bundle::parse(SLACK_BUNDLE).expect("the sample bundle");
+    s.inspect.bundle = Some(BundleState::Loaded(Box::new(b)));
+}
+
+/// Slack's page just opened: the bundle being read, live readings not in yet.
+pub fn app_loading_scene(s: &mut App) {
+    sample_scene(s);
+    s.expanded = None;
+    s.show(Nav::Category(Category::Apps));
+    s.open_app("/Applications/Slack.app");
+    s.inspect.bundle = Some(BundleState::Loading);
+}
+
+/// rust-analyzer's page (pid 1300): busy, the user's own, so every tool but the root ones runs.
+fn analyzer(s: &mut App) {
+    sample_scene(s);
+    s.expanded = None;
+    s.show(Nav::All);
+    s.open(1300);
+    sample_live(s);
+}
+
+/// rust-analyzer's page with its tools: memtrace running, the rest waiting, the root tools off.
+pub fn tools_scene(s: &mut App) {
+    analyzer(s);
+    s.inspect.put(Tool::Memtrace, RunState::Running { since: s.now });
+}
+
+/// A root process's page: the tools that read threads or memory are off, and say why.
+pub fn tools_root_scene(s: &mut App) {
+    sample_scene(s);
+    s.expanded = None;
+    s.show(Nav::Category(Category::System));
+    s.open(301);
+}
+
+/// What each tool printed for the sample's rust-analyzer.
+pub fn tool_output(tool: Tool) -> &'static str {
+    match tool {
+        Tool::Sample => r#"{"pid":1300,"process":"rust-analyzer","duration_ms":1000,"interval_ms":10,"total_samples":412,"stack_count":5,
+            "stacks":[
+              {"frames":["Thread_2201","start_wqthread","rayon_core::registry::WorkerThread::wait_until","hir_ty::infer::InferenceContext::infer_body","hir_ty::method_resolution::iterate_method_candidates","chalk_solve::solve::Solver::solve"],"count":171,"percent":41.5},
+              {"frames":["Thread_2202","start_wqthread","rayon_core::registry::WorkerThread::wait_until","ide_db::symbol_index::SymbolIndex::new","fst::raw::build::Builder::insert"],"count":96,"percent":23.3},
+              {"frames":["Thread_2190","start","main","rust_analyzer::main_loop::GlobalState::run","crossbeam_channel::select::Select::select","__psynch_cvwait"],"count":82,"percent":19.9},
+              {"frames":["Thread_2203","start_wqthread","salsa::function::fetch::fetch_cold","hir_def::nameres::collector::collect_defs"],"count":41,"percent":10.0},
+              {"frames":["Thread_2204","start_wqthread","__workq_kernreturn"],"count":22,"percent":5.3}],
+            "main_thread":{"found":true,"verdict":"idle","reason":"main thread is waiting on a condition variable (crossbeam_channel::select → __psynch_cvwait), not blocked on I/O or a lock","leaf":"__psynch_cvwait","top_frames":["Thread_2190","start","main","rust_analyzer::main_loop::GlobalState::run","crossbeam_channel::select::Select::select","__psynch_cvwait"]}}"#,
+        Tool::Hang => r#"{"main_thread":{"found":true,"verdict":"spinning","reason":"main thread is on CPU in user code (hir_ty::infer::InferenceContext::infer_body), not waiting","leaf":"hir_ty::infer::InferenceContext::infer_body",
+            "top_frames":["Thread_2190","start","main","rust_analyzer::main_loop::GlobalState::run","rust_analyzer::reload::GlobalState::switch_workspaces","hir_ty::infer::InferenceContext::infer_body"]}}"#,
+        Tool::Vmmap => r#"{"footprint_bytes":1174405120,"footprint_peak_bytes":1258291200,
+            "regions":[{"type":"MALLOC_LARGE","virtual_bytes":905969664,"resident_bytes":880803840,"dirty_bytes":880803840,"swapped_bytes":0},
+                       {"type":"MALLOC_SMALL","virtual_bytes":209715200,"resident_bytes":178257920,"dirty_bytes":176160768,"swapped_bytes":8388608},
+                       {"type":"MALLOC_TINY","virtual_bytes":62914560,"resident_bytes":50331648,"dirty_bytes":50331648,"swapped_bytes":0},
+                       {"type":"Stack","virtual_bytes":136314880,"resident_bytes":6291456,"dirty_bytes":6291456,"swapped_bytes":0},
+                       {"type":"__DATA","virtual_bytes":4194304,"resident_bytes":2097152,"dirty_bytes":1048576,"swapped_bytes":0},
+                       {"type":"MALLOC metadata","virtual_bytes":2097152,"resident_bytes":917504,"dirty_bytes":917504,"swapped_bytes":0}],
+            "total_virtual_bytes":422054862848,"total_resident_bytes":1180696576,"total_dirty_bytes":1115553792,"total_swapped_bytes":8388608}"#,
+        Tool::Vmregions => r#"{"total_resident_bytes":1180696576,"total_dirty_bytes":1115553792,"shared_resident_bytes":3145728,
+            "file_backed_dirty_bytes":2097152,"anonymous_dirty_bytes":1113456640,
+            "top_dirty":[{"type":"MALLOC_LARGE","addr_start":"14c000000","addr_end":"16c000000","prot":"rw-","max_prot":"rwx","share":"PRV","detail":"DefaultMallocZone_0x104e3c000","resident_bytes":520093696,"dirty_bytes":520093696},
+                         {"type":"MALLOC_LARGE","addr_start":"17a000000","addr_end":"18a000000","prot":"rw-","max_prot":"rwx","share":"PRV","detail":"DefaultMallocZone_0x104e3c000","resident_bytes":251658240,"dirty_bytes":251658240},
+                         {"type":"MALLOC_SMALL","addr_start":"128000000","addr_end":"130000000","prot":"rw-","max_prot":"rwx","share":"PRV","detail":"DefaultMallocZone_0x104e3c000","resident_bytes":125829120,"dirty_bytes":125829120},
+                         {"type":"Stack","addr_start":"16f604000","addr_end":"16fe00000","prot":"rw-","max_prot":"rwx","share":"PRV","detail":"thread 0","resident_bytes":1048576,"dirty_bytes":1048576},
+                         {"type":"shared memory","addr_start":"104c88000","addr_end":"104c90000","prot":"r--","max_prot":"r--","share":"SHM","resident_bytes":32768,"dirty_bytes":32768}]}"#,
+        Tool::Memtrace => r#"{"pid":1300,"command":"rust-analyzer","tree":false,"duration_ms":20000,"interval_ms":2000,
+            "samples":[{"elapsed_ms":0,"rss_kib":1146880},{"elapsed_ms":2000,"rss_kib":1150976},{"elapsed_ms":4000,"rss_kib":1159168},
+                       {"elapsed_ms":6000,"rss_kib":1157120},{"elapsed_ms":8000,"rss_kib":1167360},{"elapsed_ms":10000,"rss_kib":1175552},
+                       {"elapsed_ms":12000,"rss_kib":1173504},{"elapsed_ms":14000,"rss_kib":1183744},{"elapsed_ms":16000,"rss_kib":1189888},
+                       {"elapsed_ms":18000,"rss_kib":1196032},{"elapsed_ms":20000,"rss_kib":1200128}],
+            "polls_failed":0,"polls_skipped":0,
+            "summary":{"samples":11,"min_kib":1146880,"max_kib":1200128,"first_kib":1146880,"last_kib":1200128,"net_change_kib":53248,
+                       "growth_kib_per_min":159744,"verdict":"growing"},"growers":[]}"#,
+        Tool::Lineage => r#"{"pid":1300,"ancestors":[
+              {"pid":1300,"ppid":921,"user":"jason","command":"rust-analyzer"},
+              {"pid":921,"ppid":920,"user":"jason","command":"Code Helper (Plugin)"},
+              {"pid":920,"ppid":1,"user":"jason","command":"Code"},
+              {"pid":1,"ppid":0,"user":"root","command":"launchd"}],
+            "tree":{"pid":1300,"ppid":921,"user":"jason","command":"rust-analyzer","rss_kib":1146880,"cpu_pct":138,"count":3,"subtree_rss_kib":1160192,"subtree_cpu_pct":139.5,
+              "children":[{"pid":7533,"ppid":1300,"user":"jason","command":"<defunct>","rss_kib":0,"cpu_pct":0,"count":1,"subtree_rss_kib":0,"subtree_cpu_pct":0},
+                          {"pid":7540,"ppid":1300,"user":"jason","command":"rust-analyzer-proc-macro-srv","rss_kib":13312,"cpu_pct":1.5,"count":1,"subtree_rss_kib":13312,"subtree_cpu_pct":1.5}]}}"#,
+        Tool::Owner => r#"{"target":{"kind":"pid","raw":"1300","pid":1300},"holders":[{"pid":1300,"user":"jason","command":"rust-analyzer",
+            "executable":"/Users/jason/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rust-analyzer","started":"2026-11-19T10:40:04-05:00","hold":"process",
+            "chain":[{"pid":921,"command":"Code Helper (Plugin)"},{"pid":920,"command":"Code"},{"pid":1,"command":"launchd"}]}]}"#,
+        Tool::Runtime => r#"{"pid":1300,"command":"rust-analyzer","executable_path":"/Users/jason/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rust-analyzer",
+            "runtime":"rust","evidence":"Mach-O carries Rust panic symbols (rust_begin_unwind)",
+            "capabilities":[{"name":"user-space CPU sample","how":"spectra sample 1300"},
+                            {"name":"attach a native debugger","how":"rust-lldb -p 1300"},
+                            {"name":"flame graph","how":"spectra flamegraph 1300"}]}"#,
+        Tool::Spindump | Tool::Lsmp => "{}",
+    }
+}
+
+/// rust-analyzer's page with `tool`'s result.
+fn tool_scene(s: &mut App, tool: Tool) {
+    analyzer(s);
+    let report = tool.parse(tool_output(tool)).expect("the sample output parses");
+    s.inspect.put(tool, RunState::Done(Box::new(report)));
+}
+
+pub fn tool_sample_scene(s: &mut App) {
+    tool_scene(s, Tool::Sample);
+}
+pub fn tool_hang_scene(s: &mut App) {
+    tool_scene(s, Tool::Hang);
+}
+pub fn tool_vmmap_scene(s: &mut App) {
+    tool_scene(s, Tool::Vmmap);
+}
+pub fn tool_vmregions_scene(s: &mut App) {
+    tool_scene(s, Tool::Vmregions);
+}
+pub fn tool_memtrace_scene(s: &mut App) {
+    tool_scene(s, Tool::Memtrace);
+}
+pub fn tool_lineage_scene(s: &mut App) {
+    tool_scene(s, Tool::Lineage);
+}
+pub fn tool_owner_scene(s: &mut App) {
+    tool_scene(s, Tool::Owner);
+}
+pub fn tool_runtime_scene(s: &mut App) {
+    tool_scene(s, Tool::Runtime);
+}
+
+/// A tool that failed and one that was cancelled, and network readings that couldn't be had.
+pub fn tool_failed_scene(s: &mut App) {
+    analyzer(s);
+    s.inspect.put(Tool::Vmmap, RunState::Failed("vmmap: cannot examine process 1300 (task_for_pid failed)".into()));
+    s.inspect.put(Tool::Sample, RunState::Cancelled);
+    s.inspect.net = Default::default();
+    s.inspect.net.off = Some("spectra network top: nettop is not available".into());
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -651,5 +828,12 @@ mod tests {
         assert!(s.procs.iter().any(|p| p.executable_path.is_empty() && p.signing.is_none()));
         let ollama = s.process(1370).unwrap();
         assert_eq!((ollama.role, ollama.bundle_path()), (AiAgent, Some("/Applications/Ollama.app")));
+    }
+
+    #[test]
+    fn every_sample_tool_output_parses() {
+        for tool in Tool::ALL.into_iter().filter(|t| t.needs_root().is_none()) {
+            assert!(tool.parse(tool_output(tool)).is_ok(), "{tool:?}");
+        }
     }
 }
