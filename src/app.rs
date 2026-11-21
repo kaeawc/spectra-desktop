@@ -486,7 +486,7 @@ impl App {
             .iter()
             .flat_map(|j| diagnose(j, &self.history(j.pid)))
             .chain(self.proc_findings.iter().cloned())
-            .chain(crate::system_findings::diagnose(&self.system))
+            .chain(crate::system_findings::diagnose(&self.system, self.now))
             .collect();
         all.sort_by_key(|f| (f.severity, f.pid));
         self.findings = all;

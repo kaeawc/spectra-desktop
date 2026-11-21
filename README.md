@@ -55,7 +55,9 @@ What it shows:
     the part says "Updated 40 s ago · last reading failed: …"; one that never landed says why.
   - Findings on the Overview, each opening the Machine page: memory pressure at warning or
     critical, swap in use and up at least 64 MB over the last minute, the CPU thermally
-    throttled, and volumes over 90% full (critical from 97%).
+    throttled, and volumes over 90% full (critical from 97%). A pressure finding clears after three
+    normal readings in a row, a volume finding once it is under 88%, and a part whose reading
+    failed or is three rounds old has no finding.
 - **All processes**, then by kind and by runtime in the sidebar, with live counts. Sort by CPU,
   memory or name; search by name, pid, bundle id or path. The table only builds the rows on
   screen, so the full list stays quick. Rows group an app with its helpers, and processes of one

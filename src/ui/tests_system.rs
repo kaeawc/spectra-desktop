@@ -261,3 +261,18 @@ fn on_linux_what_spectra_doesnt_read_is_left_out() {
     );
     assert!(has(&mut rt, "sys-cpu-timeline") && has(&mut rt, "sys-ports"));
 }
+
+#[test]
+fn the_cpu_lane_needs_the_process_feed() {
+    let mut rt = scene(system_scene);
+    assert!(rt.state.has_processes());
+    assert!(has(&mut rt, "sys-lane-cpu") && has(&mut rt, "sys-lane-load"));
+    rt.state.procs.clear();
+    rt.frame(1.0 / 60.0);
+    assert!(!has(&mut rt, "sys-cpu-use"), "no tile without the feed");
+    assert!(!has(&mut rt, "sys-lane-cpu"), "no flat 0% lane either");
+    assert!(
+        has(&mut rt, "sys-lane-load"),
+        "load comes from Spectra, not the feed"
+    );
+}

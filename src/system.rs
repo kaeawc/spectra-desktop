@@ -5,8 +5,9 @@
 //! that names one differently) reads as unknown rather than failing the page. A failed reading
 //! keeps the last good one and says so; one Spectra can't take on this system hides its part.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
@@ -14,7 +15,7 @@ use serde_json::Value;
 
 use crate::app::{App, fmt_ago};
 use crate::procs::run_failure;
-use crate::run::{self, RunError};
+use crate::run::{Ended, RunError, run_until};
 
 /// How long the memory, thermal and load readings rest between rounds.
 pub const FAST: Duration = Duration::from_secs(5);
@@ -554,6 +555,19 @@ fn parse(kind: Kind, out: Result<String, Fail>) -> Reading {
 /// Runs `bin <kind> --json` with a deadline and parses what it printed. The flag says whether it
 /// ran out of time.
 pub fn fetch(bin: &str, kind: Kind, deadline: Duration) -> (Reading, bool) {
+    fetch_until(bin, kind, deadline, &CANCEL)
+}
+
+/// Set when the app quits: every reading in flight is killed, and the reading threads end.
+pub static CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// [`fetch`], also killing the reading once `cancel` is set.
+pub fn fetch_until(
+    bin: &str,
+    kind: Kind,
+    deadline: Duration,
+    cancel: &AtomicBool,
+) -> (Reading, bool) {
     let mut cmd = Command::new(bin);
     cmd.args(kind.args());
     if kind == Kind::Storage {
@@ -561,8 +575,12 @@ pub fn fetch(bin: &str, kind: Kind, deadline: Duration) -> (Reading, bool) {
             .env("XDG_CACHE_HOME", EMPTY_HOME);
     }
     let mut timed_out = false;
-    let out = match run::run(cmd, deadline, MAX_OUTPUT) {
-        Err(e) => {
+    let out = match run_until(cmd, deadline, MAX_OUTPUT, cancel) {
+        Err(Ended::Cancelled) => Err(Fail::Failed(format!(
+            "{bin} {} was stopped",
+            kind.command()
+        ))),
+        Err(Ended::Failed(e)) => {
             timed_out = matches!(e, RunError::Timeout(_));
             Err(Fail::Failed(run_failure(bin, e)))
         }
@@ -588,6 +606,19 @@ pub fn fetch(bin: &str, kind: Kind, deadline: Duration) -> (Reading, bool) {
 /// stops listening.
 pub fn spawn(tx: Sender<Reading>, wake: rune::Waker) {
     let bin = std::env::var("SPECTRA_BIN").unwrap_or_else(|_| "spectra".into());
+    start(tx, wake, bin, &|name, job| {
+        std::thread::Builder::new()
+            .name(name.into())
+            .spawn(job)
+            .map(|_| ())
+    });
+}
+
+type Spawner = dyn Fn(&str, Box<dyn FnOnce() + Send>) -> std::io::Result<()>;
+
+/// [`spawn`], with the way a thread starts handed in. A thread that can't start leaves an error
+/// on each of its readings, so the page says why instead of reading "Reading…" forever.
+fn start(tx: Sender<Reading>, wake: rune::Waker, bin: String, spawner: &Spawner) {
     let rounds: [(&str, &[Kind], Duration, Duration); 2] = [
         (
             "spectra-system-fast",
@@ -603,29 +634,41 @@ pub fn spawn(tx: Sender<Reading>, wake: rune::Waker) {
         ),
     ];
     for (name, kinds, rest, deadline) in rounds {
-        let (tx, wake, bin) = (tx.clone(), wake.clone(), bin.clone());
-        let _ = std::thread::Builder::new()
-            .name(name.into())
-            .spawn(move || {
-                let mut skip_storage = 0;
-                loop {
-                    for &kind in kinds {
-                        if kind == Kind::Storage && skip_storage > 0 {
-                            skip_storage -= 1;
-                            continue;
-                        }
-                        let (reading, timed_out) = fetch(&bin, kind, deadline);
-                        if kind == Kind::Storage && timed_out {
-                            skip_storage = STORAGE_BACKOFF;
-                        }
-                        if tx.send(reading).is_err() {
-                            return;
-                        }
-                        wake();
+        let (job_tx, job_wake, bin) = (tx.clone(), wake.clone(), bin.clone());
+        let job = move || {
+            let (tx, wake) = (job_tx, job_wake);
+            let mut skip_storage = 0;
+            loop {
+                for &kind in kinds {
+                    if CANCEL.load(Ordering::SeqCst) {
+                        return;
                     }
-                    std::thread::sleep(rest);
+                    if kind == Kind::Storage && skip_storage > 0 {
+                        skip_storage -= 1;
+                        continue;
+                    }
+                    let (reading, timed_out) = fetch(&bin, kind, deadline);
+                    if kind == Kind::Storage && timed_out {
+                        skip_storage = STORAGE_BACKOFF;
+                    }
+                    if tx.send(reading).is_err() {
+                        return;
+                    }
+                    wake();
                 }
-            });
+                std::thread::sleep(rest);
+            }
+        };
+        if let Err(e) = spawner(name, Box::new(job)) {
+            for &kind in kinds {
+                let why = Fail::Failed(format!(
+                    "Couldn't start a thread to read {}: {e}.",
+                    kind.command()
+                ));
+                let _ = tx.send(parse(kind, Err(why)));
+            }
+            wake();
+        }
     }
 }
 
@@ -671,6 +714,15 @@ impl<T> Section<T> {
         self.last.is_none() && matches!(self.error, Some(Fail::Unsupported(_)))
     }
 
+    /// Whether the numbers can't be trusted as current: the last reading failed, or the last
+    /// good one is older than three rounds.
+    pub fn stale(&self, now: f64) -> bool {
+        match self.updated {
+            None => true,
+            Some(at) => self.error.is_some() || now - at > 3.0 * (self.every.as_secs_f64() + 2.0),
+        }
+    }
+
     /// Whether no reading, good or bad, has landed yet.
     pub fn waiting(&self) -> bool {
         self.last.is_none() && self.error.is_none()
@@ -708,7 +760,8 @@ pub struct MemPoint {
 /// together every `FAST`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CpuPoint {
-    pub cpu: f64,
+    /// None when there was no process feed to sum it from.
+    pub cpu: Option<f64>,
     pub load1: f64,
 }
 
@@ -717,6 +770,13 @@ pub struct CpuPoint {
 pub fn counter_deltas(values: &[f64]) -> Vec<f64> {
     values.windows(2).map(|w| (w[1] - w[0]).max(0.0)).collect()
 }
+
+/// Normal memory readings in a row before a pressure finding clears.
+pub const CALM_READINGS: u32 = 3;
+/// A full volume's finding clears once it is below this many percent.
+pub const VOLUME_CLEAR: f64 = 88.0;
+/// A volume is full from this many percent.
+pub const VOLUME_WARN: f64 = 90.0;
 
 /// Readings swap growth is judged over: a minute at one every 5 s.
 pub const SWAP_WINDOW: usize = 13;
@@ -744,6 +804,11 @@ pub struct System {
     pub network: Section<Network>,
     pub mem_history: VecDeque<MemPoint>,
     pub cpu_history: VecDeque<CpuPoint>,
+    /// The memory pressure a finding is showing, and the Normal readings in a row since.
+    pub held_pressure: Option<Pressure>,
+    pub calm_readings: u32,
+    /// Mounts a finding is showing as full.
+    pub full_mounts: HashSet<String>,
     pub rx: Option<Receiver<Reading>>,
     pub tx: Option<Sender<Reading>>,
 }
@@ -773,13 +838,18 @@ impl System {
             network: Section::new(SLOW),
             mem_history: VecDeque::new(),
             cpu_history: VecDeque::new(),
+            held_pressure: None,
+            calm_readings: 0,
+            full_mounts: HashSet::new(),
             rx: Some(rx),
             tx: Some(tx),
         }
     }
 
-    /// Lands a reading at window time `now`; `cpu` is the CPU in use the process feed last saw.
-    pub fn land(&mut self, r: Reading, now: f64, cpu: f64) {
+    /// Lands a reading at window time `now`; `cpu` is the CPU in use the process feed last saw,
+    /// or `None` when there is no process feed.
+    pub fn land(&mut self, r: Reading, now: f64, cpu: impl Into<Option<f64>>) {
+        let cpu = cpu.into();
         match r {
             Reading::Memory(m) => {
                 if self.memory.land(m, now)
@@ -794,6 +864,7 @@ impl System {
                         compressions: m.compressions,
                     };
                     push(&mut self.mem_history, point);
+                    self.track_pressure(m.pressure);
                 }
             }
             Reading::Load(l) => {
@@ -816,12 +887,46 @@ impl System {
                 self.power.land(p, now);
             }
             Reading::Storage(s) => {
-                self.storage.land(s, now);
+                if self.storage.land(s, now) {
+                    self.track_full();
+                }
             }
             Reading::Network(n) => {
                 self.network.land(n, now);
             }
         }
+    }
+
+    /// A pressure finding appears on Warning or Critical and clears after `CALM_READINGS`
+    /// Normal readings in a row, so one calm reading doesn't make it flicker.
+    fn track_pressure(&mut self, now: Pressure) {
+        match now {
+            Pressure::Warning | Pressure::Critical => {
+                self.held_pressure = Some(now);
+                self.calm_readings = 0;
+            }
+            Pressure::Normal if self.held_pressure.is_some() => {
+                self.calm_readings += 1;
+                if self.calm_readings >= CALM_READINGS {
+                    self.held_pressure = None;
+                    self.calm_readings = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A volume is full above `VOLUME_WARN` percent and stops being full below `VOLUME_CLEAR`.
+    fn track_full(&mut self) {
+        let mut keep = HashSet::new();
+        for v in self.volumes() {
+            let used = v.used_pct();
+            if used >= VOLUME_WARN || (used >= VOLUME_CLEAR && self.full_mounts.contains(&v.mount))
+            {
+                keep.insert(v.mount.clone());
+            }
+        }
+        self.full_mounts = keep;
     }
 
     /// Swap-ins, swap-outs and compressions between the last two memory readings.
@@ -887,7 +992,8 @@ impl System {
 impl App {
     /// Lands one machine-wide reading and refreshes the findings.
     pub fn land_reading(&mut self, r: Reading) {
-        self.system.land(r, self.now, self.stats.cpu);
+        self.system
+            .land(r, self.now, self.has_processes().then_some(self.stats.cpu));
         self.refresh_findings();
     }
 
@@ -899,7 +1005,8 @@ impl App {
         }
         let any = !landed.is_empty();
         for r in landed {
-            self.system.land(r, self.now, self.stats.cpu);
+            self.system
+                .land(r, self.now, self.has_processes().then_some(self.stats.cpu));
         }
         if any {
             self.refresh_findings();
@@ -1428,5 +1535,75 @@ pub mod tests {
                 "{kind:?} failed: {failed:?}"
             );
         }
+    }
+
+    #[test]
+    fn setting_the_flag_stops_a_long_reading_promptly() {
+        use std::sync::Arc;
+        let slow = script("slow", "sleep 30");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            flag.store(true, Ordering::SeqCst);
+        });
+        let start = std::time::Instant::now();
+        let (r, timed_out) = fetch_until(
+            slow.to_str().unwrap(),
+            Kind::Memory,
+            Duration::from_secs(20),
+            &cancel,
+        );
+        t.join().unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            start.elapsed()
+        );
+        assert!(!timed_out);
+        assert!(
+            matches!(r, Reading::Memory(Err(Fail::Failed(ref w))) if w.contains("stopped")),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn a_thread_that_cant_start_leaves_an_error_on_every_section() {
+        let (tx, rx) = channel();
+        let wake: rune::Waker = std::sync::Arc::new(|| {});
+        start(tx, wake, "spectra".into(), &|_, _| {
+            Err(std::io::Error::other("out of threads"))
+        });
+        let mut s = System::new();
+        let mut n = 0;
+        while let Ok(r) = rx.try_recv() {
+            s.land(r, 0.0, None);
+            n += 1;
+        }
+        assert_eq!(n, 6);
+        for why in [
+            s.memory.error.as_ref(),
+            s.thermal.error.as_ref(),
+            s.load.error.as_ref(),
+            s.power.error.as_ref(),
+            s.storage.error.as_ref(),
+            s.network.error.as_ref(),
+        ] {
+            assert!(
+                why.is_some_and(|w| w.why().contains("out of threads")),
+                "{why:?}"
+            );
+        }
+        assert!(!s.memory.waiting());
+    }
+
+    #[test]
+    fn no_cpu_point_without_the_process_feed() {
+        let mut s = System::new();
+        let load = |v| Reading::Load(Ok(Load { load1: v, cpus: 8 }));
+        s.land(load(1.0), 0.0, None);
+        s.land(load(2.0), 5.0, 40.0);
+        let cpus: Vec<_> = s.cpu_history.iter().map(|p| p.cpu).collect();
+        assert_eq!(cpus, [None, Some(40.0)]);
     }
 }

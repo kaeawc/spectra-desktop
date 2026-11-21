@@ -6,7 +6,7 @@ use crate::procs::fmt_mem;
 use crate::system::{Pressure, System, ThermalState, swap_growth};
 
 /// How full a volume may get before it's worth a look, and before it's urgent, in percent.
-pub const VOLUME_WARN: f64 = 90.0;
+pub use crate::system::VOLUME_WARN;
 pub const VOLUME_CRITICAL: f64 = 97.0;
 
 fn finding(
@@ -34,26 +34,31 @@ fn mib(bytes: f64) -> String {
     fmt_mem(bytes / 1024.0)
 }
 
-/// Every machine-wide finding, from the latest good readings.
-pub fn diagnose(s: &System) -> Vec<Finding> {
+/// Every machine-wide finding, from the latest good readings at window time `now`. A part whose
+/// last reading failed, or is older than three rounds, says nothing: it can't be trusted.
+pub fn diagnose(s: &System, now: f64) -> Vec<Finding> {
     let mut out = Vec::new();
-    if let Some(m) = &s.memory.last {
+    if let Some(m) = s.memory.last.as_ref().filter(|_| !s.memory.stale(now)) {
         let free = m.free_pct.map_or_else(String::new, |p| {
             format!(" {p:.0}% of memory is free for new work.")
         });
-        let severity = match m.pressure {
-            Pressure::Critical => Some(Severity::Critical),
-            Pressure::Warning => Some(Severity::Warning),
-            _ => None,
+        let held = s.held_pressure;
+        let severity = match held {
+            Some(Pressure::Critical) => Some(Severity::Critical),
+            Some(_) => Some(Severity::Warning),
+            None => None,
         };
         if let Some(severity) = severity {
             out.push(finding(
                 "sys-memory-pressure",
                 "Memory",
                 severity,
-                format!("Memory pressure is {}", m.pressure.label().to_lowercase()),
+                format!(
+                    "Memory pressure is {}",
+                    held.unwrap_or(m.pressure).label().to_lowercase()
+                ),
                 format!("The system is compressing and swapping to make room.{free}"),
-                "Quit what you aren't using; Top consumers on the System page lists who holds the most.",
+                "Quit what you aren't using; Top consumers on the Machine page lists who holds the most.",
             ));
         }
         if let Some(grown) = swap_growth(&s.mem_history) {
@@ -63,11 +68,16 @@ pub fn diagnose(s: &System) -> Vec<Finding> {
                 Severity::Warning,
                 format!("Swap grew {} in the last minute", mib(grown)),
                 format!("{} of swap is in use and still rising, so memory is short.", mib(m.swap_used)),
-                "Find the process that keeps growing (By memory on the System page) and restart or quit it.",
+                "Find the process that keeps growing (By memory on the Machine page) and restart or quit it.",
             ));
         }
     }
-    if s.thermal_state() == Some(ThermalState::Throttled) {
+    let thermal_fresh = if s.thermal.last.is_some() {
+        !s.thermal.stale(now)
+    } else {
+        !s.power.stale(now)
+    };
+    if thermal_fresh && s.thermal_state() == Some(ThermalState::Throttled) {
         let limit = s.speed_limit().map_or_else(String::new, |l| {
             format!(" The CPU may run at {l:.0}% of its speed.")
         });
@@ -91,11 +101,14 @@ pub fn diagnose(s: &System) -> Vec<Finding> {
             "Everything runs slower until it cools. Check what's busy, and give the machine air.",
         ));
     }
-    let full: Vec<_> = s
-        .volumes()
-        .into_iter()
-        .filter(|v| v.used_pct() >= VOLUME_WARN)
-        .collect();
+    let full: Vec<_> = if s.storage.stale(now) {
+        Vec::new()
+    } else {
+        s.volumes()
+            .into_iter()
+            .filter(|v| s.full_mounts.contains(&v.mount))
+            .collect()
+    };
     if let Some(worst) = full
         .iter()
         .max_by(|a, b| a.used_pct().total_cmp(&b.used_pct()))
@@ -160,8 +173,24 @@ mod tests {
         }
     }
 
+    /// The window time of the newest good reading, so nothing is old yet.
+    fn at(s: &System) -> f64 {
+        [
+            s.memory.updated,
+            s.thermal.updated,
+            s.storage.updated,
+            s.power.updated,
+        ]
+        .into_iter()
+        .flatten()
+        .fold(0.0, f64::max)
+    }
+
     fn rules(s: &System) -> Vec<(&'static str, Severity)> {
-        diagnose(s).iter().map(|f| (f.rule, f.severity)).collect()
+        diagnose(s, at(s))
+            .iter()
+            .map(|f| (f.rule, f.severity))
+            .collect()
     }
 
     #[test]
@@ -175,7 +204,7 @@ mod tests {
         s.land(Reading::Memory(Ok(mem(Pressure::Warning, 0.0))), 5.0, 0.0);
         assert_eq!(rules(&s), [("sys-memory-pressure", Severity::Warning)]);
         s.land(Reading::Memory(Ok(mem(Pressure::Critical, 0.0))), 10.0, 0.0);
-        let f = diagnose(&s);
+        let f = diagnose(&s, at(&s));
         assert_eq!(
             (f[0].severity, f[0].title.as_str()),
             (Severity::Critical, "Memory pressure is critical")
@@ -186,9 +215,103 @@ mod tests {
             "it opens the System page"
         );
         assert!(f[0].detail.contains("12% of memory is free"));
-        // A failed reading keeps the last good one, and its finding.
+        // A failed reading keeps the last good one for the page, but its finding is dropped.
         s.land(Reading::Memory(Err(Fail::Failed("boom".into()))), 15.0, 0.0);
-        assert_eq!(rules(&s), [("sys-memory-pressure", Severity::Critical)]);
+        assert!(diagnose(&s, 15.0).is_empty());
+    }
+
+    #[test]
+    fn memory_pressure_clears_only_after_three_calm_readings() {
+        let mut s = System::new();
+        s.land(Reading::Memory(Ok(mem(Pressure::Warning, 0.0))), 0.0, 0.0);
+        for (i, calm) in [(1, true), (2, true)] {
+            s.land(
+                Reading::Memory(Ok(mem(Pressure::Normal, 0.0))),
+                i as f64 * 5.0,
+                0.0,
+            );
+            assert!(
+                calm && !rules(&s).is_empty(),
+                "still showing after {i} calm readings"
+            );
+        }
+        // A relapse starts the count over.
+        s.land(Reading::Memory(Ok(mem(Pressure::Warning, 0.0))), 15.0, 0.0);
+        for i in 4..6 {
+            s.land(
+                Reading::Memory(Ok(mem(Pressure::Normal, 0.0))),
+                i as f64 * 5.0,
+                0.0,
+            );
+            assert!(!rules(&s).is_empty());
+        }
+        s.land(Reading::Memory(Ok(mem(Pressure::Normal, 0.0))), 30.0, 0.0);
+        assert!(
+            rules(&s).is_empty(),
+            "the third calm reading in a row clears it"
+        );
+    }
+
+    #[test]
+    fn a_volume_finding_clears_only_below_88_percent() {
+        let mut s = System::new();
+        let tb = 1e12;
+        let put = |s: &mut System, pct: f64, now: f64| {
+            s.land(
+                Reading::Storage(Ok(vec![vol(
+                    "/System/Volumes/Data",
+                    pct / 100.0 * tb,
+                    (1.0 - pct / 100.0) * tb,
+                )])),
+                now,
+                0.0,
+            )
+        };
+        put(&mut s, 91.0, 0.0);
+        assert_eq!(rules(&s).len(), 1);
+        put(&mut s, 89.0, 30.0);
+        assert_eq!(rules(&s).len(), 1, "89% is inside the margin: still shown");
+        put(&mut s, 87.0, 60.0);
+        assert!(rules(&s).is_empty(), "below 88% clears it");
+        put(&mut s, 89.0, 90.0);
+        assert!(rules(&s).is_empty(), "89% alone doesn't bring it back");
+    }
+
+    #[test]
+    fn findings_from_old_or_failed_readings_are_dropped() {
+        let mut s = System::new();
+        let tb = 1e12;
+        s.land(Reading::Memory(Ok(mem(Pressure::Critical, 0.0))), 0.0, 0.0);
+        s.land(
+            Reading::Thermal(Ok(Thermal {
+                state: ThermalState::Throttled,
+                evidence: String::new(),
+                speed_limit: None,
+            })),
+            0.0,
+            0.0,
+        );
+        s.land(
+            Reading::Storage(Ok(vec![vol("/System/Volumes/Data", 0.95 * tb, 0.05 * tb)])),
+            0.0,
+            0.0,
+        );
+        assert_eq!(diagnose(&s, 10.0).len(), 3);
+        // Fast readings are old after about 21 s, slow ones after 96 s.
+        let late = diagnose(&s, 30.0);
+        assert_eq!(late.len(), 1);
+        assert_eq!(late[0].rule, "sys-volume-full");
+        assert!(diagnose(&s, 200.0).is_empty());
+        s.land(
+            Reading::Storage(Err(Fail::Failed("df hung".into()))),
+            20.0,
+            0.0,
+        );
+        assert!(
+            diagnose(&s, 20.0)
+                .iter()
+                .all(|f| f.rule != "sys-volume-full")
+        );
     }
 
     #[test]
@@ -210,7 +333,7 @@ mod tests {
                 0.0,
             );
         }
-        let f = diagnose(&s);
+        let f = diagnose(&s, at(&s));
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].rule, "sys-swap-growing");
         assert_eq!(f[0].title, "Swap grew 120 MB in the last minute");
@@ -234,7 +357,7 @@ mod tests {
             5.0,
             0.0,
         );
-        let f = diagnose(&s);
+        let f = diagnose(&s, at(&s));
         assert_eq!(f[0].rule, "sys-thermal-throttled");
         assert_eq!(
             f[0].detail,
@@ -257,7 +380,7 @@ mod tests {
             30.0,
             0.0,
         );
-        let f = diagnose(&s);
+        let f = diagnose(&s, at(&s));
         assert_eq!(
             (f[0].rule, f[0].severity),
             ("sys-volume-full", Severity::Warning)
@@ -276,7 +399,7 @@ mod tests {
             60.0,
             0.0,
         );
-        let f = diagnose(&s);
+        let f = diagnose(&s, at(&s));
         assert_eq!(
             f.len(),
             1,

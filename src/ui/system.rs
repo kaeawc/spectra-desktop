@@ -180,22 +180,24 @@ fn cpu(s: &App, k: &Kit) -> El {
     body = body.child(tiles);
     if !sys.load.unsupported() {
         let h = &sys.cpu_history;
-        let all = [
-            Lane {
+        let mut all = Vec::new();
+        // The CPU lane needs the process feed; without it there is no number to draw.
+        if s.has_processes() {
+            all.push(Lane {
                 key: "sys-lane-cpu",
                 label: "CPU in use",
-                values: h.iter().map(|p| p.cpu).collect(),
+                values: h.iter().map(|p| p.cpu.unwrap_or(0.0)).collect(),
                 unit: pct,
                 mark: Mark::Line,
-            },
-            Lane {
-                key: "sys-lane-load",
-                label: "Load, last minute",
-                values: h.iter().map(|p| p.load1).collect(),
-                unit: load_fmt,
-                mark: Mark::Line,
-            },
-        ];
+            });
+        }
+        all.push(Lane {
+            key: "sys-lane-load",
+            label: "Load, last minute",
+            values: h.iter().map(|p| p.load1).collect(),
+            unit: load_fmt,
+            mark: Mark::Line,
+        });
         body = body.child(lanes("sys-cpu", h.len(), &all, None, k.c.text_accent, k));
     }
     body

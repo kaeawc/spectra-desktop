@@ -80,6 +80,7 @@ fn setup(s: &mut App, wake: rune::Waker) {
 /// moment for them to be killed, since the process ends right after.
 fn on_quit(s: &mut App, _: &mut Tx) {
     s.inspect.cancel_all();
+    system::CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
     run::wait_idle(Duration::from_secs(2));
 }
 
@@ -107,7 +108,12 @@ fn poll(s: &mut App, clock: f64, tx: &mut Tx) -> bool {
     if s.has_processes() || s.on_page() || s.nav == groups::Nav::System {
         tx.wake_after(STATUS_TICK);
     }
-    landed || (s.feed_status(), s.system.statuses(s.now)) != status
+    let now_status = (s.feed_status(), s.system.statuses(s.now));
+    // A reading growing old takes its finding away, with no new reading to say so.
+    if now_status.1 != status.1 && !landed {
+        s.refresh_findings();
+    }
+    landed || now_status != status
 }
 
 fn main() {
