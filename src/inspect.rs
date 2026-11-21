@@ -140,7 +140,8 @@ pub struct JvmPage {
 /// What the worker hands back, numbered by the job it was.
 #[derive(Clone, Debug)]
 pub enum Landed {
-    Tool { job: u64, tool: Tool, result: Result<Report, Failure> },
+    /// `pid` is the process it ran on: a recording that started late is stopped there.
+    Tool { job: u64, tool: Tool, pid: u32, result: Result<Report, Failure> },
     Live { job: u64, round: Round },
     Bundle { job: u64, result: Result<Box<Bundle>, String> },
 }
@@ -171,6 +172,9 @@ pub struct Inspector {
     pub bundle: Option<BundleState>,
     bundle_job: Option<Flight>,
     pub jvm: JvmPage,
+    /// Recording starts not yet landed, job to pid, whichever page they were for: each may have
+    /// started a recording that quitting must stop.
+    starts: HashMap<u64, u32>,
     job: u64,
     pub spectra: Arc<dyn Spectra>,
     pub exec: Exec,
@@ -193,6 +197,7 @@ impl Inspector {
             bundle: None,
             bundle_job: None,
             jvm: JvmPage::default(),
+            starts: HashMap::new(),
             job: 0,
             spectra: Arc::new(System),
             exec: Exec::Thread,
@@ -259,8 +264,8 @@ impl Default for Inspector {
 
 /// Runs `tool`'s Spectra commands on `pid` in order and reads the answer. Native memory reads
 /// NMT and the VM's own view, and says plainly when NMT is off. Stopping a recording always
-/// stops it, even when writing it out failed or was cancelled; a recording started as the page
-/// was left is stopped again at once.
+/// stops it, even when writing it out failed or was cancelled; a start that was cancelled or
+/// failed (a deadline, or an attach error after `JFR.start` ran) is stopped again at once.
 fn perform(tool: Tool, pid: u32, paths: &Paths, spectra: &dyn Spectra, flag: &AtomicBool) -> Result<Report, Failure> {
     let steps = tool.steps(pid, paths);
     let deadline = tool.deadline();
@@ -283,8 +288,11 @@ fn perform(tool: Tool, pid: u32, paths: &Paths, spectra: &dyn Spectra, flag: &At
         }
         Tool::JfrStart => {
             let started = spectra.run(&steps[0], deadline, flag);
-            if flag.load(Ordering::Relaxed) || matches!(started, Err(Failure::Cancelled)) {
+            let cancelled = flag.load(Ordering::Relaxed) || matches!(started, Err(Failure::Cancelled));
+            if cancelled || started.is_err() {
                 let _ = spectra.run(&jvm_tools::stop_args(pid), STOP_DEADLINE, &never);
+            }
+            if cancelled {
                 return Err(Failure::Cancelled);
             }
             tool.parse(&started?).map_err(Failure::Failed)
@@ -450,25 +458,36 @@ impl App {
         Paths { out, hprof: self.heap_dump_path().unwrap_or_default() }
     }
 
-    /// Stops the flight recording on `pid` off the UI thread; nothing waits for the answer.
+    /// Stops the flight recording on `pid` off the UI thread; nothing waits for the answer but
+    /// quitting, which waits a moment for it from the moment it's queued.
     fn stop_recording(&mut self, pid: u32) {
         let (job, _) = self.inspect.next_job();
         let spectra = Arc::clone(&self.inspect.spectra);
+        let pending = run::pending();
         self.submit_inspect(
             Box::new(move || {
+                let _pending = pending;
                 let never = AtomicBool::new(false);
                 let result = spectra.run(&jvm_tools::stop_args(pid), STOP_DEADLINE, &never).map(|_| Report::JfrStarted);
-                Landed::Tool { job, tool: Tool::JfrStop, result }
+                Landed::Tool { job, tool: Tool::JfrStop, pid, result }
             }),
-            Landed::Tool { job, tool: Tool::JfrStop, result: Err(Failure::Cancelled) },
+            Landed::Tool { job, tool: Tool::JfrStop, pid, result: Err(Failure::Cancelled) },
         );
     }
 
-    /// Stops the page's flight recording before the app quits, waiting for Spectra.
+    /// Stops the page's flight recording before the app quits, waiting for Spectra, and any
+    /// recording a start still in flight (or done but not landed) may have begun.
     pub fn stop_recording_now(&mut self) {
-        if let Some(rec) = self.inspect.jvm.recording.take() {
-            let never = AtomicBool::new(false);
-            let _ = self.inspect.spectra.run(&jvm_tools::stop_args(rec.pid), STOP_DEADLINE, &never);
+        if let Some(r) = self.inspect.runs.get(&Tool::JfrStart) {
+            r.cancel.store(true, Ordering::Relaxed);
+        }
+        let mut pids: Vec<u32> = self.inspect.jvm.recording.take().map(|r| r.pid).into_iter().collect();
+        pids.extend(self.inspect.starts.drain().map(|(_, pid)| pid));
+        pids.sort_unstable();
+        pids.dedup();
+        let never = AtomicBool::new(false);
+        for pid in pids {
+            let _ = self.inspect.spectra.run(&jvm_tools::stop_args(pid), STOP_DEADLINE, &never);
         }
     }
 
@@ -501,12 +520,18 @@ impl App {
         let spectra = Arc::clone(&self.inspect.spectra);
         let flag = Arc::clone(&cancel);
         self.inspect.runs.insert(tool, ToolRun { state: RunState::Running { since: self.now }, job, cancel });
+        if tool == Tool::JfrStart {
+            self.inspect.starts.insert(job, pid);
+        }
+        // Both may run `jfr stop` after their first command ends: quitting waits for that too.
+        let pending = matches!(tool, Tool::JfrStart | Tool::JfrStop).then(run::pending);
         self.submit_inspect(
             Box::new(move || {
+                let _pending = pending;
                 let result = perform(tool, pid, &paths, &*spectra, &flag);
-                Landed::Tool { job, tool, result }
+                Landed::Tool { job, tool, pid, result }
             }),
-            Landed::Tool { job, tool, result: Err(Failure::Failed("Spectra Desktop hit an internal error running it.".into())) },
+            Landed::Tool { job, tool, pid, result: Err(Failure::Failed("Spectra Desktop hit an internal error running it.".into())) },
         );
     }
 
@@ -666,16 +691,21 @@ impl App {
 
     pub fn land_inspected(&mut self, l: Landed) {
         let now = self.now;
+        if let Landed::Tool { job, tool: Tool::JfrStart, pid, result } = &l {
+            self.inspect.starts.remove(job);
+            // A start that got through after its run was cancelled or its page was left: nothing
+            // will keep or stop that recording, so stop it now.
+            let wanted = self.inspect.runs.get(&Tool::JfrStart).is_some_and(|r| r.job == *job && !matches!(r.state, RunState::Cancelling));
+            if result.is_ok() && !wanted {
+                self.stop_recording(*pid);
+            }
+        }
         let i = &mut self.inspect;
         match l {
-            Landed::Tool { job, tool, result } => {
+            Landed::Tool { job, tool, pid, result } => {
                 let Some(r) = i.runs.get_mut(&tool).filter(|r| r.job == job) else { return };
-                if tool == Tool::JfrStart
-                    && result.is_ok()
-                    && !matches!(r.state, RunState::Cancelling)
-                    && let Some(Subject::Process { pid, .. }) = &i.subject
-                {
-                    i.jvm.recording = Some(Recording { pid: *pid, since: now });
+                if tool == Tool::JfrStart && result.is_ok() && !matches!(r.state, RunState::Cancelling) {
+                    i.jvm.recording = Some(Recording { pid, since: now });
                 }
                 r.state = match (&r.state, result) {
                     (RunState::Cancelling, _) | (_, Err(Failure::Cancelled)) => RunState::Cancelled,
@@ -1296,6 +1326,101 @@ pub(crate) mod tests {
         );
         s.stop_recording_now();
         assert_eq!(jvm_calls(&fake, "jfr stop"), 1, "only once");
+    }
+
+    /// The work a test's `Exec::Held` is holding, to run and land in an order of its own.
+    fn take_held(s: &App) -> Vec<Work> {
+        match &s.inspect.exec {
+            Exec::Held(q) => std::mem::take(&mut *q.lock().unwrap()),
+            Exec::Thread => Vec::new(),
+        }
+    }
+
+    /// Runs a recording start to the end, so `jfr start` succeeded, without landing it.
+    fn started_not_landed(s: &mut App) -> Landed {
+        s.run_tool(Tool::JfrStart);
+        let mut work = take_held(s);
+        assert_eq!(work.len(), 1);
+        let landed = (work.pop().unwrap())();
+        assert!(matches!(&landed, Landed::Tool { pid: 7, result: Ok(_), .. }), "{landed:?}");
+        landed
+    }
+
+    const STOP_7: [&str; 6] = ["jvm", "jfr", "stop", "--name", "spectra-desktop", "7"];
+
+    #[test]
+    fn a_start_that_lands_after_the_page_was_left_is_stopped() {
+        let (mut s, fake) = jvm_faked(Fake::all());
+        s.open(7);
+        let landed = started_not_landed(&mut s);
+        s.open(900);
+        s.run_held_inspect();
+        assert_eq!(jvm_calls(&fake, "jfr stop"), 0, "nothing knew of it yet");
+        s.land_inspected(landed);
+        s.run_held_inspect();
+        assert_eq!(jvm_calls(&fake, "jfr stop"), 1);
+        assert_eq!(fake.calls().last().unwrap(), &STOP_7);
+        assert!(s.inspect.jvm.recording.is_none());
+    }
+
+    #[test]
+    fn a_start_that_lands_after_cancel_is_stopped() {
+        let (mut s, fake) = jvm_faked(Fake::all());
+        s.open(7);
+        let landed = started_not_landed(&mut s);
+        s.cancel_tool(Tool::JfrStart);
+        s.land_inspected(landed);
+        assert_eq!(s.inspect.state(Tool::JfrStart), Some(&RunState::Cancelled));
+        assert!(s.inspect.jvm.recording.is_none());
+        s.run_held_inspect();
+        assert_eq!(jvm_calls(&fake, "jfr stop"), 1);
+        assert_eq!(fake.calls().last().unwrap(), &STOP_7);
+        assert_eq!(s.tool_refusal(Tool::JfrStart), None, "it can start again");
+    }
+
+    #[test]
+    fn quitting_with_a_start_done_but_not_landed_stops_it() {
+        let (mut s, fake) = jvm_faked(Fake::all());
+        s.open(7);
+        let _landed = started_not_landed(&mut s);
+        s.stop_recording_now();
+        assert_eq!(jvm_calls(&fake, "jfr stop"), 1, "stopped there and then");
+        assert_eq!(fake.calls().last().unwrap(), &STOP_7);
+    }
+
+    #[test]
+    fn quitting_with_a_start_in_flight_cancels_and_stops_it() {
+        let (mut s, fake) = jvm_faked(Fake::all());
+        s.open(7);
+        s.run_tool(Tool::JfrStart);
+        s.stop_recording_now();
+        assert_eq!(jvm_calls(&fake, "jfr stop"), 1, "stopped there and then");
+        let landed = (take_held(&s).pop().unwrap())();
+        assert!(matches!(landed, Landed::Tool { result: Err(Failure::Cancelled), .. }), "the start itself was cancelled");
+    }
+
+    #[test]
+    fn quitting_with_a_start_from_a_page_already_left_stops_it() {
+        let (mut s, fake) = jvm_faked(Fake::all());
+        s.open(7);
+        let _landed = started_not_landed(&mut s);
+        s.open(900);
+        s.stop_recording_now();
+        assert_eq!(jvm_calls(&fake, "jfr stop"), 1);
+        assert_eq!(fake.calls().last().unwrap(), &STOP_7);
+    }
+
+    #[test]
+    fn a_failed_start_is_stopped_too() {
+        let mut fake = Fake::all();
+        fake.replies.insert("jvm jfr start", Err("timed out after 30s".into()));
+        let (mut s, fake) = jvm_faked(fake);
+        s.open(7);
+        s.run_tool(Tool::JfrStart);
+        s.run_held_inspect();
+        assert_eq!(jvm_calls(&fake, "jfr stop"), 1, "JFR.start may have run before it failed");
+        assert_eq!(s.inspect.state(Tool::JfrStart), Some(&RunState::Failed("timed out after 30s".into())));
+        assert!(s.inspect.jvm.recording.is_none());
     }
 
     /// Needs Spectra and runs it on a `sleep` this test starts: `cargo test -- --ignored`.

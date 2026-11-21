@@ -73,7 +73,8 @@ fn setup(s: &mut App, wake: rune::Waker) {
 }
 
 /// Quitting stops every Spectra job the pages started (a memtrace can run 20 s), and waits a
-/// moment for them to be killed, since the process ends right after.
+/// moment for them to be killed, and for any queued `jfr stop`, since the process ends right
+/// after.
 fn on_quit(s: &mut App, _: &mut Tx) {
     // A flight recording the open page started ends with the app, like leaving the page.
     s.stop_recording_now();

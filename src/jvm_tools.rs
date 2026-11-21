@@ -2,11 +2,13 @@
 //! heap, GC, native memory, Spectra's diagnosis, heap dumps and flight recordings), and the
 //! sums the page works out from them, such as a histogram's growth since the last one.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use serde::Deserialize;
 
+use crate::bundle::nullable;
 use crate::findings::Severity;
 
 /// The name the page's flight recording goes by, so stopping it touches no one else's.
@@ -17,7 +19,9 @@ pub const RECORDING: &str = "spectra-desktop";
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ThreadDumpReport {
+    #[serde(deserialize_with = "nullable")]
     pub summary: ThreadSummary,
+    #[serde(deserialize_with = "nullable")]
     pub dump: Dump,
 }
 
@@ -29,6 +33,7 @@ pub struct ThreadSummary {
     #[serde(rename = "virtual")]
     pub virtual_threads: u64,
     /// `RUNNABLE`, `BLOCKED`, `WAITING`, `TIMED_WAITING`, …
+    #[serde(deserialize_with = "nullable")]
     pub by_state: BTreeMap<String, u64>,
     pub deadlocks: u64,
 }
@@ -36,23 +41,34 @@ pub struct ThreadSummary {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Dump {
+    #[serde(deserialize_with = "nullable")]
     pub captured_at: String,
+    #[serde(deserialize_with = "nullable")]
     pub threads: Vec<JavaThread>,
+    #[serde(deserialize_with = "nullable")]
     pub deadlocks: Vec<Deadlock>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct JavaThread {
+    #[serde(deserialize_with = "nullable")]
     pub name: String,
+    #[serde(deserialize_with = "nullable")]
     pub state: String,
+    #[serde(deserialize_with = "nullable")]
     pub category: String,
+    #[serde(deserialize_with = "nullable")]
     pub detail: String,
     /// The monitor it waits for, when it's blocked.
+    #[serde(deserialize_with = "nullable")]
     pub lock: String,
+    #[serde(deserialize_with = "nullable")]
     pub top_frame: String,
     /// Innermost first, each `at …`.
+    #[serde(deserialize_with = "nullable")]
     pub stack: Vec<String>,
+    #[serde(deserialize_with = "nullable")]
     pub raw_block: String,
     pub daemon: bool,
 }
@@ -122,16 +138,22 @@ impl ThreadState {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Deadlock {
+    #[serde(deserialize_with = "nullable")]
     pub threads: Vec<String>,
+    #[serde(deserialize_with = "nullable")]
     pub locks: Vec<String>,
+    #[serde(deserialize_with = "nullable")]
     pub waits: Vec<Wait>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Wait {
+    #[serde(deserialize_with = "nullable")]
     pub thread: String,
+    #[serde(deserialize_with = "nullable")]
     pub lock: String,
+    #[serde(deserialize_with = "nullable")]
     pub held_by: String,
 }
 
@@ -259,14 +281,18 @@ impl ThreadDumpReport {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct HistogramReport {
+    #[serde(deserialize_with = "nullable")]
     pub histogram: Histogram,
+    #[serde(deserialize_with = "nullable")]
     pub suspects: Vec<HistogramSuspect>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Histogram {
+    #[serde(deserialize_with = "nullable")]
     pub entries: Vec<ClassCount>,
+    #[serde(deserialize_with = "nullable")]
     pub total: ClassCount,
 }
 
@@ -276,14 +302,18 @@ pub struct ClassCount {
     pub rank: u64,
     pub instances: u64,
     pub bytes: u64,
+    #[serde(deserialize_with = "nullable")]
     pub class_name: String,
+    #[serde(deserialize_with = "nullable")]
     pub module: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct HistogramSuspect {
+    #[serde(deserialize_with = "nullable")]
     pub class_name: String,
+    #[serde(deserialize_with = "nullable")]
     pub reason: String,
     pub instances: u64,
     pub bytes: u64,
@@ -551,12 +581,14 @@ pub struct Nmt {
     pub enabled: bool,
     pub total_reserved_kib: f64,
     pub total_committed_kib: f64,
+    #[serde(deserialize_with = "nullable")]
     pub categories: Vec<NmtCategory>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct NmtCategory {
+    #[serde(deserialize_with = "nullable")]
     pub name: String,
     pub reserved_kib: f64,
     pub committed_kib: f64,
@@ -565,7 +597,9 @@ pub struct NmtCategory {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Section {
+    #[serde(deserialize_with = "nullable")]
     pub output: String,
+    #[serde(deserialize_with = "nullable")]
     pub error: String,
 }
 
@@ -585,8 +619,11 @@ impl Section {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct VmMemory {
+    #[serde(deserialize_with = "nullable")]
     pub heap_info: Section,
+    #[serde(deserialize_with = "nullable")]
     pub metaspace: Section,
+    #[serde(deserialize_with = "nullable")]
     pub code_cache: Section,
 }
 
@@ -663,20 +700,30 @@ pub fn native_memory(
 #[serde(default)]
 pub struct ExplainReport {
     pub pid: u32,
+    #[serde(deserialize_with = "nullable")]
     pub jdk_vendor: String,
+    #[serde(deserialize_with = "nullable")]
     pub jdk_version: String,
+    #[serde(deserialize_with = "nullable")]
     pub java_home: String,
+    #[serde(deserialize_with = "nullable")]
     pub vm_args: String,
+    #[serde(deserialize_with = "nullable")]
     pub observations: Vec<Observation>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Observation {
+    #[serde(deserialize_with = "nullable")]
     pub id: String,
+    #[serde(deserialize_with = "nullable")]
     pub severity: String,
+    #[serde(deserialize_with = "nullable")]
     pub summary: String,
+    #[serde(deserialize_with = "nullable")]
     pub evidence: String,
+    #[serde(deserialize_with = "nullable")]
     pub recommendation: String,
 }
 
@@ -719,6 +766,7 @@ pub fn heap_dump(out: &str) -> Result<HeapDumpReport, String> {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct LeakReport {
+    #[serde(deserialize_with = "nullable")]
     pub report: Leaks,
 }
 
@@ -729,25 +777,30 @@ pub struct Leaks {
     pub reachable_objects: u64,
     pub reachable_bytes: u64,
     pub threshold_percent: f64,
+    #[serde(deserialize_with = "nullable")]
     pub suspects: Vec<LeakSuspect>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct LeakSuspect {
+    #[serde(deserialize_with = "nullable")]
     pub kind: String,
+    #[serde(deserialize_with = "nullable")]
     pub class_name: String,
     pub instances: u64,
     pub retained_bytes: u64,
     pub percent_of_heap: f64,
     pub accumulation_point: Option<Accumulation>,
     pub path_to_root: Option<RootPath>,
+    #[serde(deserialize_with = "nullable")]
     pub description: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Accumulation {
+    #[serde(deserialize_with = "nullable")]
     pub class_name: String,
     pub retained_bytes: u64,
     pub percent_of_heap: f64,
@@ -757,19 +810,23 @@ pub struct Accumulation {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct RootPath {
+    #[serde(deserialize_with = "nullable")]
     pub roots: Vec<Root>,
+    #[serde(deserialize_with = "nullable")]
     pub steps: Vec<Step>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Root {
+    #[serde(deserialize_with = "nullable")]
     pub kind: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Step {
+    #[serde(deserialize_with = "nullable")]
     pub class_name: String,
 }
 
@@ -803,13 +860,16 @@ pub struct DominatorReport {
     pub total_shallow_bytes: u64,
     pub reachable_objects: u64,
     pub reachable_bytes: u64,
+    #[serde(deserialize_with = "nullable")]
     pub suspects: Vec<Retained>,
+    #[serde(deserialize_with = "nullable")]
     pub classes: Vec<Retained>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Retained {
+    #[serde(deserialize_with = "nullable")]
     pub class_name: String,
     pub instances: u64,
     pub shallow_bytes: u64,
@@ -822,18 +882,23 @@ pub struct Retained {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct JfrSummary {
+    #[serde(deserialize_with = "nullable")]
     pub path: String,
+    #[serde(deserialize_with = "nullable")]
     pub version: String,
     pub chunks: u64,
+    #[serde(deserialize_with = "nullable")]
     pub start: String,
+    #[serde(deserialize_with = "nullable")]
     pub duration: String,
+    #[serde(deserialize_with = "nullable")]
     pub events: Vec<JfrEvent>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct JfrEvent {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", deserialize_with = "nullable")]
     pub kind: String,
     pub count: u64,
     pub size_bytes: u64,
@@ -926,6 +991,8 @@ pub fn out_dir() -> PathBuf {
 }
 
 /// `<dir>/<name>-<pid>-<UTC time>.<ext>`, the name reduced to letters, digits, `.`, `_`, `-`.
+/// A name already on disk, or already handed out by this app (its file may not be written yet),
+/// gets `-2`, `-3`, … before the extension.
 pub fn out_path(dir: &Path, name: &str, pid: u32, unix: i64, ext: &str) -> String {
     let safe: String = name
         .chars()
@@ -939,10 +1006,27 @@ pub fn out_path(dir: &Path, name: &str, pid: u32, unix: i64, ext: &str) -> Strin
         .collect();
     let safe = safe.trim_matches(['-', '.']);
     let safe = if safe.is_empty() { "jvm" } else { safe };
-    dir.join(format!("{safe}-{pid}-{}.{ext}", stamp(unix)))
-        .to_string_lossy()
-        .into_owned()
+    let base = format!("{safe}-{pid}-{}", stamp(unix));
+    let mut issued = ISSUED.lock().unwrap_or_else(|e| e.into_inner());
+    (1..)
+        .map(|n| {
+            let file = if n == 1 {
+                format!("{base}.{ext}")
+            } else {
+                format!("{base}-{n}.{ext}")
+            };
+            dir.join(file)
+        })
+        .find(|p| !p.exists() && !issued.contains(p))
+        .map(|p| {
+            issued.insert(p.clone());
+            p.to_string_lossy().into_owned()
+        })
+        .expect("an unused name")
 }
+
+/// Every output path this app has handed out.
+static ISSUED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
 /// Unix seconds as `20261121T221327Z`.
 pub fn stamp(unix: i64) -> String {
@@ -1236,5 +1320,71 @@ pub(crate) mod tests {
             stop_args(7),
             ["jvm", "jfr", "stop", "--name", "spectra-desktop", "7"]
         );
+    }
+
+    #[test]
+    fn nulls_from_spectra_read_as_empty() {
+        let l: LeakReport =
+            read(r#"{"report": {"suspects": null, "reachable_bytes": 9}}"#).unwrap();
+        assert!(l.report.suspects.is_empty());
+        assert_eq!(l.report.reachable_bytes, 9);
+        let l: LeakReport = read(
+            r#"{"report": {"suspects": [{"class_name": null, "description": null,
+                "path_to_root": {"roots": null, "steps": null}}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            l.report.suspects[0].path_to_root.as_ref().unwrap().line(),
+            ""
+        );
+        let l: LeakReport = read(r#"{"report": null}"#).unwrap();
+        assert!(l.report.suspects.is_empty());
+        let d: DominatorReport =
+            read(r#"{"suspects": null, "classes": null, "reachable_bytes": 5}"#).unwrap();
+        assert!(d.suspects.is_empty() && d.classes.is_empty());
+        assert_eq!(d.reachable_bytes, 5);
+        let e: ExplainReport =
+            read(r#"{"pid": 7, "jdk_vendor": null, "observations": null}"#).unwrap();
+        assert!(e.observations.is_empty() && e.findings().is_empty());
+        assert_eq!(e.pid, 7);
+        let t: ThreadDumpReport = read(
+            r#"{"summary": {"by_state": null}, "dump": {"threads": [{"name": "main",
+                "stack": null}], "deadlocks": null}}"#,
+        )
+        .unwrap();
+        assert!(t.dump.deadlocks.is_empty() && t.summary.by_state.is_empty());
+        assert!(t.dump.threads[0].stack.is_empty());
+        let h: HistogramReport =
+            read(r#"{"histogram": {"entries": null}, "suspects": null}"#).unwrap();
+        assert!(h.histogram.entries.is_empty() && h.suspects.is_empty());
+        let n: Nmt = read(r#"{"enabled": true, "categories": null}"#).unwrap();
+        assert!(n.categories.is_empty());
+        let j: JfrSummary = read(r#"{"events": null, "path": null}"#).unwrap();
+        assert!(j.events.is_empty() && j.busiest().is_empty());
+    }
+
+    #[test]
+    fn an_output_file_never_reuses_a_name() {
+        let dir = std::env::temp_dir().join(format!("spectra-out-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = out_path(&dir, "Lab", 7, 0, "hprof");
+        assert_eq!(
+            first,
+            dir.join("Lab-7-19700101T000000Z.hprof").to_string_lossy()
+        );
+        // Asked again in the same second before anything was written: a new name.
+        let second = out_path(&dir, "Lab", 7, 0, "hprof");
+        assert_eq!(
+            second,
+            dir.join("Lab-7-19700101T000000Z-2.hprof").to_string_lossy()
+        );
+        // A file already there (from an earlier run of the app) is skipped too.
+        std::fs::write(dir.join("Lab-7-19700101T000000Z-3.hprof"), b"").unwrap();
+        let fourth = out_path(&dir, "Lab", 7, 0, "hprof");
+        assert_eq!(
+            fourth,
+            dir.join("Lab-7-19700101T000000Z-4.hprof").to_string_lossy()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
