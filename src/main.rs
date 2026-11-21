@@ -16,7 +16,10 @@ mod procs;
 mod run;
 mod sample;
 mod sample_jvm;
+mod sample_system;
 mod signal;
+mod system;
+mod system_findings;
 mod tools;
 mod ui;
 
@@ -47,6 +50,9 @@ fn setup(s: &mut App, wake: rune::Waker) {
                 std::thread::sleep(REFRESH);
             }
         });
+    }
+    if let Some(tx) = s.system.tx.take() {
+        system::spawn(tx, wake.clone());
     }
     s.wake = Some(wake.clone());
     if s.me.uid.is_none() {
@@ -79,11 +85,12 @@ fn on_quit(s: &mut App, _: &mut Tx) {
     // A flight recording the open page started ends with the app, like leaving the page.
     s.stop_recording_now();
     s.inspect.cancel_all();
+    system::CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
     run::wait_idle(Duration::from_secs(2));
 }
 
 fn poll(s: &mut App, clock: f64, tx: &mut Tx) -> bool {
-    let status = s.feed_status();
+    let status = (s.feed_status(), s.system.statuses(s.now));
     s.now = clock;
     let mut landed = false;
     while let Some(feed) = s.feed.as_ref().and_then(|rx| rx.try_recv().ok()) {
@@ -98,13 +105,20 @@ fn poll(s: &mut App, clock: f64, tx: &mut Tx) -> bool {
     landed |= s.land_work();
     // An open page's tools, live readings and bundle, and its next live round once it's due.
     landed |= s.land_inspect();
+    // Memory, thermal, load, power, disks and network, for the System page.
+    landed |= s.land_system();
     s.tick_inspector();
     // A hung Spectra sends nothing, so look again on a timer to say the numbers are getting old;
     // an open page also looks for its next live round.
-    if s.has_processes() || s.on_page() {
+    if s.has_processes() || s.on_page() || s.nav == groups::Nav::System {
         tx.wake_after(STATUS_TICK);
     }
-    landed || s.feed_status() != status
+    let now_status = (s.feed_status(), s.system.statuses(s.now));
+    // A reading growing old takes its finding away, with no new reading to say so.
+    if now_status.1 != status.1 && !landed {
+        s.refresh_findings();
+    }
+    landed || now_status != status
 }
 
 fn main() {
@@ -159,6 +173,10 @@ fn main() {
             ("tool-heapdump", sample_jvm::tool_heapdump_scene),
             ("tool-jfr", sample_jvm::tool_jfr_scene),
             ("tool-jfr-summary", sample_jvm::tool_jfr_summary_scene),
+            ("system", sample_system::system_scene),
+            ("system-pressure", sample_system::system_pressure_scene),
+            ("system-failed", sample_system::system_failed_scene),
+            ("system-linux", sample_system::system_linux_scene),
         ],
         setup: Some(setup),
         poll: Some(poll),
