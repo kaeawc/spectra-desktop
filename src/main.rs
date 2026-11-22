@@ -145,7 +145,7 @@ fn poll(s: &mut App, clock: f64, tx: &mut Tx) -> bool {
     // A folder's size or Time Machine's snapshots, for the Storage page; while a folder is
     // being measured, the page's "started … ago" keeps counting (tick_storage says when it changed).
     landed |= s.tick_storage();
-    if s.overview_visible() || s.storage.busy() {
+    if s.window_shown() && (s.overview_visible() || s.storage.busy()) {
         tx.wake_after(STATUS_TICK);
     }
     // An open page's live rounds rest while the window is hidden.

@@ -582,3 +582,127 @@ fn only_plain_spectra_calls_are_routed() {
     with_env.args(["load", "--json"]).env("HOME", "/var/empty");
     assert!(answer_with(&d, &with_env, SEC, &never()).is_none());
 }
+
+/// A fake daemon that lists `method` and answers it with `reading`.
+fn reading_daemon(method: &'static str, reading: Value) -> Fake {
+    Fake::serve(
+        &[method],
+        h(move |m, _| (m == method).then(|| Ok(reading.clone()))),
+    )
+}
+
+#[test]
+fn the_machine_readings_route_to_the_daemon_only_while_it_lists_them() {
+    let all = [
+        "memory.current",
+        "thermal.current",
+        "power.current",
+        "network.current",
+    ];
+    for (args, method) in [
+        (["memory", "--json"], "memory.current"),
+        (["thermal", "--json"], "thermal.current"),
+        (["power", "--json"], "power.current"),
+        (["network", "--json"], "network.current"),
+    ] {
+        assert_eq!(routed(&args, &all), method);
+        assert_eq!(routed(&args, &[method]), method);
+        assert_eq!(routed(&args, &[]), "cli", "{method} unlisted runs the CLI");
+        assert_eq!(routed(&args, &["exec"]), EXEC);
+    }
+    // The Network page's windows are another call.
+    assert_eq!(
+        routed(&["network", "top", "--json", "--duration", "3s"], &all),
+        "cli"
+    );
+}
+
+#[test]
+fn memory_comes_from_the_daemon_in_the_shape_the_cli_prints() {
+    let f = reading_daemon(
+        "memory.current",
+        json!({"physical_bytes": 17179869184u64, "pressure_level": "warn", "swap": {"used_bytes": 1024}}),
+    );
+    let out = f
+        .daemon()
+        .answer(&["memory", "--json"], SEC, &never())
+        .unwrap()
+        .unwrap();
+    let m = crate::system::parse_memory(&out).unwrap();
+    assert_eq!((m.physical, m.swap_used), (17179869184.0, 1024.0));
+    assert_eq!(f.calls("memory.current"), vec![json!({})]);
+}
+
+#[test]
+fn thermal_comes_from_the_daemon_in_the_shape_the_cli_prints() {
+    let f = reading_daemon(
+        "thermal.current",
+        json!({"verdict": "throttled", "evidence": "speed limit 70%", "limits": {"cpu_speed_limit": 70}}),
+    );
+    let out = f
+        .daemon()
+        .answer(&["thermal", "--json"], SEC, &never())
+        .unwrap()
+        .unwrap();
+    let t = crate::system::parse_thermal(&out).unwrap();
+    assert_eq!(t.state, crate::system::ThermalState::Throttled);
+    assert_eq!(t.speed_limit, Some(70.0));
+}
+
+#[test]
+fn power_comes_from_the_daemon_in_the_shape_the_cli_prints() {
+    let f = reading_daemon(
+        "power.current",
+        json!({"battery": {"pct": 42, "on_battery": true}, "thermal": {"pressure": "nominal"}}),
+    );
+    let out = f
+        .daemon()
+        .answer(&["power", "--json"], SEC, &never())
+        .unwrap()
+        .unwrap();
+    let p = crate::system::parse_power(&out).unwrap();
+    assert_eq!(
+        p.battery.map(|b| (b.pct, b.on_battery)),
+        Some((Some(42.0), true))
+    );
+    assert_eq!(p.thermal_pressure.as_deref(), Some("nominal"));
+}
+
+#[test]
+fn network_comes_from_the_daemon_in_the_shape_the_cli_prints() {
+    let f = reading_daemon(
+        "network.current",
+        json!({"listening_ports": [{"port": 8080, "proto": "tcp", "pid": 9, "local_addr": "127.0.0.1"}]}),
+    );
+    let out = f
+        .daemon()
+        .answer(&["network", "--json"], SEC, &never())
+        .unwrap()
+        .unwrap();
+    let n = crate::system::parse_network(&out).unwrap();
+    assert_eq!(
+        n.ports.iter().map(|p| p.port).collect::<Vec<_>>(),
+        vec![8080]
+    );
+}
+
+#[test]
+fn a_machine_reading_the_daemon_does_not_list_or_garbles_runs_the_cli() {
+    // Listed but not this one: the CLI, and the daemon is never asked for it.
+    let f = reading_daemon("memory.current", json!({"physical_bytes": 1}));
+    let d = f.daemon();
+    for args in [
+        ["thermal", "--json"],
+        ["power", "--json"],
+        ["network", "--json"],
+    ] {
+        assert!(d.answer(&args, SEC, &never()).is_none(), "{args:?}");
+    }
+    assert!(f.calls("thermal.current").is_empty());
+    // Listed, but its answer isn't a reading: the CLI, and the method isn't asked again.
+    let f = reading_daemon("power.current", Value::Null);
+    let d = f.daemon();
+    assert!(d.answer(&["power", "--json"], SEC, &never()).is_none());
+    assert!(d.answer(&["power", "--json"], SEC, &never()).is_none());
+    assert_eq!(f.calls("power.current").len(), 1);
+}

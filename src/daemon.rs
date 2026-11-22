@@ -37,6 +37,11 @@ const PROCESS_LIST: &str = "process.list";
 /// Pushes `process.update` notifications shaped like [`PROCESS_LIST`]'s answer.
 const PROCESS_SUBSCRIBE: &str = "process.subscribe";
 /// How long a connection may take to say which methods it has.
+/// The Machine page's readings, in the CLI's `--json` shape.
+const MEMORY: &str = "memory.current";
+const THERMAL: &str = "thermal.current";
+const POWER: &str = "power.current";
+const NETWORK: &str = "network.current";
 const HELLO: Duration = Duration::from_secs(3);
 /// After the daemon couldn't be reached, how long calls go to the CLI before it's tried again.
 const RETRY: Duration = Duration::from_secs(30);
@@ -136,6 +141,27 @@ pub static TABLE: &[Entry] = &[
         cli: &["load"],
         method: "watch.current",
         answer: load,
+    },
+    // The Machine page's readings, each the same JSON the CLI's `--json` prints.
+    Entry {
+        cli: &["memory", "--json"],
+        method: MEMORY,
+        answer: memory,
+    },
+    Entry {
+        cli: &["thermal", "--json"],
+        method: THERMAL,
+        answer: thermal,
+    },
+    Entry {
+        cli: &["power", "--json"],
+        method: POWER,
+        answer: power,
+    },
+    Entry {
+        cli: &["network", "--json"],
+        method: NETWORK,
+        answer: network,
     },
 ];
 
@@ -629,6 +655,54 @@ fn load(d: &Daemon, _: &[&str], deadline: Duration, cancel: &AtomicBool) -> Resu
         .ok_or_else(|| Error::Shape("sample had no load1".into()))?;
     let cpus = s.get("ncpu").and_then(Value::as_u64).unwrap_or(0);
     Ok(json!({"load1": load1, "cpus": cpus}).to_string())
+}
+
+/// A reading the daemon answers in the CLI's `--json` shape, passed on as it came.
+fn reading(
+    d: &Daemon,
+    method: &str,
+    deadline: Duration,
+    cancel: &AtomicBool,
+) -> Result<String, Error> {
+    match d.call(method, json!({}), deadline, cancel)? {
+        v @ Value::Object(_) => Ok(v.to_string()),
+        _ => Err(Error::Shape(format!("{method} had no reading"))),
+    }
+}
+
+/// `spectra memory --json`.
+fn memory(
+    d: &Daemon,
+    _: &[&str],
+    deadline: Duration,
+    cancel: &AtomicBool,
+) -> Result<String, Error> {
+    reading(d, MEMORY, deadline, cancel)
+}
+
+/// `spectra thermal --json`.
+fn thermal(
+    d: &Daemon,
+    _: &[&str],
+    deadline: Duration,
+    cancel: &AtomicBool,
+) -> Result<String, Error> {
+    reading(d, THERMAL, deadline, cancel)
+}
+
+/// `spectra power --json`.
+fn power(d: &Daemon, _: &[&str], deadline: Duration, cancel: &AtomicBool) -> Result<String, Error> {
+    reading(d, POWER, deadline, cancel)
+}
+
+/// `spectra network --json`.
+fn network(
+    d: &Daemon,
+    _: &[&str],
+    deadline: Duration,
+    cancel: &AtomicBool,
+) -> Result<String, Error> {
+    reading(d, NETWORK, deadline, cancel)
 }
 
 fn read_loop(stream: UnixStream, pending: &Pending, alive: &AtomicBool, pushed: &Pushed) {

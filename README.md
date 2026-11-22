@@ -18,15 +18,18 @@ thread, so nothing needs setting up:
 
 The window asks for each reading after the last one landed and rested. While the window is
 hidden, minimised or covered, nothing is read: the feeds, the Machine readings, an open page's
-live charts and the Activity page all rest (except Activity's "Keep recording"), and coming back
-reads at once.
+live charts and Logs' Follow, the Activity and Network pages, the Overview's "Right now" look and
+the Storage page's Time Machine read all rest (except Activity's "Keep recording"; a folder being
+measured may finish), and coming back reads at once.
 
 **Spectra's daemon.** Where the daemon (`~/.spectra/daemon.sock`, started with
 `spectra daemon start` if its socket is missing) already holds a reading, the app asks it on one
 long-lived connection instead of starting a `spectra` process. One table in `src/daemon.rs`
 decides, from the methods `daemon.status` lists: the process list from `process.list` (pushed
-by `process.subscribe`), JVMs from `jvm.list`, and the load average from the host sample
-`alerts.subscribe` pushes (else `watch.current`). A daemon without a method, or none at all,
+by `process.subscribe`), JVMs from `jvm.list`, the load average from the host sample
+`alerts.subscribe` pushes (else `watch.current`), and the Machine page's memory, thermal, power
+and network readings from `memory.current`, `thermal.current`, `power.current` and
+`network.current`. A daemon without a method, or none at all,
 leaves that call to the CLI as before; a daemon with the generic `exec` method takes every other
 call too, named by `spectra capabilities --json`.
 
