@@ -20,9 +20,13 @@ mod sample_system;
 mod sample_activity;
 mod signal;
 mod spawns;
+mod sample_tree;
+mod startup;
+mod sample_startup;
 mod system;
 mod system_findings;
 mod tools;
+mod tree;
 mod ui;
 
 use std::sync::mpsc::RecvTimeoutError;
@@ -89,6 +93,7 @@ fn on_quit(s: &mut App, _: &mut Tx) {
     s.inspect.cancel_all();
     system::CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
     s.activity.cancel();
+    startup::CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
     run::wait_idle(Duration::from_secs(2));
 }
 
@@ -116,6 +121,8 @@ fn poll(s: &mut App, clock: f64, tx: &mut Tx) -> bool {
     if s.activity_wanted() {
         tx.wake_after(STATUS_TICK);
     }
+    // What starts at login, and a Disable or Enable's answer, for the Startup page.
+    landed |= s.land_startup();
     s.tick_inspector();
     // A hung Spectra sends nothing, so look again on a timer to say the numbers are getting old;
     // an open page also looks for its next live round.
@@ -189,6 +196,11 @@ fn main() {
             ("activity", sample_activity::activity_scene),
             ("activity-storm", sample_activity::activity_storm_scene),
             ("activity-unsupported", sample_activity::activity_unsupported_scene),
+            ("startup", sample_startup::startup_scene),
+            ("startup-confirm", sample_startup::startup_confirm_scene),
+            ("startup-failed", sample_startup::startup_failed_scene),
+            ("tree", sample_tree::tree_scene),
+            ("tree-search", sample_tree::tree_search_scene),
         ],
         setup: Some(setup),
         poll: Some(poll),

@@ -87,6 +87,32 @@ What it shows:
     spawn storm), opening Activity filtered to that parent. The finding appears only while
     recording is on (the page open, or Keep recording): with both off nothing is watching, so
     there is nothing to find.
+- **Startup**, under Machine: everything that launches at login or boot, and the background
+  services launchd runs, so you can see what runs without you asking. Grouped by the app it
+  belongs to (an app's login item, agents, daemons and helpers together), then items no app
+  owns, then other background services. Each row: name, kind (login item, launch agent, launch
+  daemon, background service), when it starts (at login, at boot, kept alive, on an interval, on
+  a schedule, on demand), whether it runs and its pid (opening the process's page when the list
+  has it), Disabled, and the program's path. Search by name, label, app, path or pid; "Running
+  now" keeps what runs; "Not from Apple" (on at first) hides Apple's items, and turning it off
+  reads them too. Over 200 rows, the rest are counted and the search narrows them.
+  - Read when the page opens and on Refresh: `spectra startup list --json --scope all` (with
+    `--include-apple` once Apple's items are shown) and `spectra services --json --domain all`,
+    off the UI thread with a 60 s deadline. A failed read says why with Try again, and a failed
+    refresh keeps the list from before. Sources Spectra couldn't read and unreadable plists are
+    named; a failed services read leaves the startup items and says so.
+  - Disable and Enable, for your own launch agents only (`~/Library/LaunchAgents`, not Apple's,
+    not a label two plists share): only on a press, behind a confirmation that names the item
+    and its label and says what changes. Disabling stops it starting at login or on its own until
+    you enable it, and Spectra also unloads it, so if it's loaded it's unloaded and if it's
+    running it stops. Enabling says it will start at your next login, and that it starts now only
+    when it isn't loaded. Cancel has focus, Esc cancels, and one press sends one
+    `spectra startup disable|enable --json --scope user -- <label>`. Buttons stay off until the
+    re-read shows the result, and quitting waits a moment for a change, then leaves it to finish
+    rather than stopping it half done.
+    The outcome is Spectra's own: done, refused (and why), or didn't take, and the list is read
+    again. System items say "Needs an administrator; Spectra Desktop doesn't run sudo"; login
+    items say to use System Settings › General › Login Items.
 - **All processes**, then by kind and by runtime in the sidebar, with live counts. Sort by CPU,
   memory or name; search by name, pid, bundle id or path. The table only builds the rows on
   screen, so the full list stays quick. Rows group an app with its helpers, and processes of one
@@ -94,6 +120,15 @@ What it shows:
   that tells them apart beside its name. Clicking a row or arrowing onto it only moves the
   cursor. Return or a double click opens a process's page or an app's page; on any other group
   (twelve `zsh`) it opens or closes the group. The triangle always only opens or closes it.
+- **Tree view**: Grouped | Tree over the list switches to who started whom, and the choice stays
+  while the app runs. launchd's children (and any process whose parent isn't in the list) are
+  the roots, so an app, a terminal or a daemon each heads its own branch; launchd is a row of its
+  own. Each row shows its own CPU and memory, and "With children" what its whole branch uses.
+  Siblings sort by their branch's totals, so a quiet shell running a busy build rises with it.
+  Branches open with the triangle or Right, and close with Left (which then steps to the
+  parent); what's open stays open from reading to reading while those processes run. A search
+  keeps the matches and every process above them, opened down to each match. Return or a double
+  click opens the process's page. Only the rows on screen are built, as in the grouped list.
 - **An app's page**: all its processes together (CPU, memory and threads over the last few
   minutes, summed), its network and energy while the page is open, its processes (each opens its
   page), and its bundle from `spectra --json <App.app>`, read once each time the page opens: what
@@ -197,7 +232,9 @@ cargo run -- --list-scenes  # sample, all, apps, group, process, signed, detail,
                             # jvm-tools, tool-threads, tool-threads-deadlock, tool-histogram,
                             # tool-gc, tool-nmt, tool-nmt-off, tool-explain, tool-heapdump,
                             # tool-jfr, tool-jfr-summary,
-                            # system, system-pressure, system-failed, system-linux
+                            # system, system-pressure, system-failed, system-linux,
+                            # activity, activity-storm, activity-unsupported, startup,
+                            # startup-confirm, startup-failed, tree, tree-search
 cargo run -- --snap out.png --scene tool-sample --size 1100x3000  # tall, to show the tools
 cargo test                                             # unit and headless UI tests
 SPECTRA_BIN=/path/to/spectra cargo test -- --ignored --nocapture  # reads both live feeds, and
@@ -220,6 +257,14 @@ SPECTRA_BIN=/path/to/spectra cargo test -- --ignored --nocapture  # reads both l
 - `src/system.rs`: the machine-wide readings, their threads, parsing and history;
   `src/system_findings.rs`: the rules that turn them into findings; `src/sample_system.rs`:
   their sample data.
+- `src/startup.rs`: the Startup page's reads and changes, their JSON, grouping and filters,
+  behind a `Runner` trait that tests replace with a fake that records what it was asked;
+  `src/sample_startup.rs`: its sample data, from fixtures captured on a Mac in
+  `tests/fixtures/startup`.
+- `src/spawns.rs`: the Activity page's recording rounds, their JSON, the event buffer, the
+  last-minute summary and the spawn-storm rule; `src/sample_activity.rs`: its sample data.
+- `src/tree.rs`: the Tree view: building the parent/child tree, branch totals, search and
+  flattening it into rows; `src/sample_tree.rs`: its sample data.
 - `src/app.rs`: state and each process's recent history; `src/main.rs`: the polling threads.
 - `src/sample.rs` and `src/sample_jvm.rs`: sample data for the headless scenes and tests.
 - `src/ui/`: the view, one module per page.
