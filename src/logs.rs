@@ -223,6 +223,8 @@ pub struct LogsReport {
     pub truncated: bool,
     /// Entries left out because another process of the same name logged them.
     pub others: usize,
+    /// A Follow round came back cut off at [`QUERY_TOP`], so entries between rounds are missing.
+    pub follow_gaps: bool,
 }
 
 impl LogsReport {
@@ -284,7 +286,7 @@ pub fn parse(json: &str) -> Result<LogsReport, String> {
     Ok(LogsReport {
         entries,
         truncated: raw.truncated.unwrap_or_default(),
-        others: 0,
+        ..LogsReport::default()
     })
 }
 
@@ -577,6 +579,7 @@ pub fn merge(old: &mut LogsReport, new: LogsReport) {
         .filter(|e| e.timestamp > newest)
         .collect();
     old.others += new.others;
+    old.follow_gaps |= new.truncated;
     fresh.append(&mut old.entries);
     fresh.truncate(MAX_ROWS);
     old.entries = fresh;
@@ -589,6 +592,30 @@ pub(crate) mod tests {
     /// Captured from `spectra logs --json --process Finder --last 5m`, one entry of each kind,
     /// with `log show`'s closing count line as Spectra passes it on.
     pub const FINDER: &str = include_str!("../tests/fixtures/logs/finder.json");
+
+    #[test]
+    fn a_cut_off_follow_round_is_remembered_as_gaps() {
+        let mut old = LogsReport::default();
+        merge(
+            &mut old,
+            LogsReport {
+                truncated: false,
+                ..Default::default()
+            },
+        );
+        assert!(!old.follow_gaps);
+        merge(
+            &mut old,
+            LogsReport {
+                truncated: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            old.follow_gaps && !old.truncated,
+            "the first query's own note stays as it was"
+        );
+    }
 
     #[test]
     fn parses_the_fixture_newest_first_and_drops_the_count_line() {

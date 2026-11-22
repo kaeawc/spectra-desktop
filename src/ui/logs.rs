@@ -172,6 +172,16 @@ fn entries(s: &App, r: &LogsReport, t: &Target, k: &Kit) -> El {
         )
         .key("logs-truncated"));
     }
+    if r.follow_gaps {
+        body = body.child(line(
+            format!(
+                "Following can't keep up: this process wrote more than {} entries in a minute, so some are missing. Pick Error or Fault to follow fewer.",
+                fmt_count(QUERY_TOP as u64)
+            ),
+            k,
+        )
+        .key("logs-follow-gaps"));
+    }
     if r.entries.is_empty() {
         return body.child(
             line(
