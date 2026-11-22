@@ -72,7 +72,11 @@ pub fn startup_scene(s: &mut App) {
 /// The confirmation before disabling watchman, which is running.
 pub fn startup_confirm_scene(s: &mut App) {
     startup_scene(s);
-    s.ask_startup("com.github.facebook.watchman", Action::Disable);
+    s.ask_startup(
+        "com.github.facebook.watchman",
+        "/Users/me/Library/LaunchAgents/com.github.facebook.watchman.plist",
+        Action::Disable,
+    );
 }
 
 /// A read that failed before any listing landed.

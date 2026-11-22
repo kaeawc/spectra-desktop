@@ -15,6 +15,8 @@ use crate::startup::{ChangeStatus, Ran};
 
 const BREW: &str = "su-com.github.domt4.homebrew-autoupdate";
 const TOOLBOX: &str = "su-com.jetbrains.toolbox";
+const TOOLBOX_LABEL: &str = "com.jetbrains.toolbox";
+const TOOLBOX_PLIST: &str = "/Users/me/Library/LaunchAgents/com.jetbrains.toolbox.plist";
 const WATCHMAN: &str = "su-com.github.facebook.watchman";
 
 fn scene_with(f: fn(&mut App), fake: Fake) -> (Runtime<App>, Arc<Fake>) {
@@ -273,10 +275,11 @@ fn disable_sends_exactly_one_change_with_the_label_after_the_confirmation() {
         vec![vec![
             "startup",
             "disable",
-            "com.github.facebook.watchman",
             "--json",
             "--scope",
-            "user"
+            "user",
+            "--",
+            "com.github.facebook.watchman"
         ]],
         "one press, one change"
     );
@@ -333,10 +336,11 @@ fn a_disabled_agent_offers_enable() {
         vec![vec![
             "startup",
             "enable",
-            "com.github.domt4.homebrew-autoupdate",
             "--json",
             "--scope",
-            "user"
+            "user",
+            "--",
+            "com.github.domt4.homebrew-autoupdate"
         ]]
     );
 }
@@ -358,7 +362,16 @@ fn system_items_and_login_items_show_the_action_off_with_why() {
         rt.state.startup.confirm.is_none(),
         "an off button opens nothing"
     );
-    rt.update(|s, _| s.ask_startup("com.docker.vmnetd", crate::startup::Action::Disable));
+    rt.update(|s, _| {
+        let path = s
+            .startup
+            .listing
+            .as_ref()
+            .and_then(|l| l.items.iter().find(|i| i.label == "com.docker.vmnetd"))
+            .map(|i| i.plist_path.clone())
+            .unwrap();
+        s.ask_startup("com.docker.vmnetd", &path, crate::startup::Action::Disable)
+    });
     assert!(
         rt.state.startup.confirm.is_none(),
         "nor does asking for it directly"
@@ -428,6 +441,7 @@ fn while_a_change_is_on_its_way_nothing_else_can_be_asked() {
     rt.update(|s, _| {
         s.ask_startup(
             "com.github.facebook.watchman",
+            "/Users/me/Library/LaunchAgents/com.github.facebook.watchman.plist",
             crate::startup::Action::Disable,
         )
     });
@@ -439,4 +453,91 @@ fn while_a_change_is_on_its_way_nothing_else_can_be_asked() {
     );
     land(&mut rt);
     assert_eq!(fake.changes().len(), 1);
+}
+
+#[test]
+fn the_row_stays_off_until_the_re_read_after_a_change_lands() {
+    let fake = Fake::new();
+    let gate = Arc::clone(&fake.gate);
+    let (mut rt, fake) = scene_with(startup_scene, fake);
+    press(&mut rt, &format!("{TOOLBOX}-act"));
+    press(&mut rt, "su-confirm-send");
+    // The change lands Done; its re-read runs on a thread that the gate holds.
+    let held = gate.lock().unwrap();
+    rt.state.startup.threaded = true;
+    rt.update(|s, _| {
+        s.land_startup();
+    });
+    settle(&mut rt);
+    assert!(matches!(
+        rt.state.startup.outcome.as_ref().unwrap().status,
+        ChangeStatus::Done(_)
+    ));
+    assert!(rt.state.startup.busy(), "the old rows are still on screen");
+    assert!(!rt.state.startup.sending());
+    rt.update(|s, _| s.ask_startup(TOOLBOX_LABEL, TOOLBOX_PLIST, crate::startup::Action::Disable));
+    assert!(rt.state.startup.confirm.is_none(), "nothing opens meanwhile");
+    press(&mut rt, &format!("{BREW}-act"));
+    assert!(rt.state.startup.confirm.is_none(), "an off button opens nothing");
+    assert!(!has(&mut rt, "su-outcome-dismiss"), "nor can the outcome go");
+    drop(held);
+    for _ in 0..200 {
+        rt.update(|s, _| {
+            s.land_startup();
+        });
+        if !rt.state.startup.busy() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(!rt.state.startup.busy(), "the re-read landed");
+    settle(&mut rt);
+    press(&mut rt, &format!("{TOOLBOX}-act"));
+    assert!(rt.state.startup.confirm.is_some(), "the row is back");
+    assert_eq!(fake.changes().len(), 1);
+}
+
+#[test]
+fn two_rows_sharing_a_label_act_only_on_their_own() {
+    let (mut rt, fake) = scene(startup_scene);
+    rt.update(|s, _| {
+        let l = s.startup.listing.as_mut().unwrap();
+        let mut twin = l
+            .items
+            .iter()
+            .find(|i| i.label == TOOLBOX_LABEL)
+            .unwrap()
+            .clone();
+        twin.plist_path = "/Users/me/Library/LaunchAgents/elsewhere.plist".into();
+        twin.name = "Twin".into();
+        twin.duplicate = false;
+        for i in l.items.iter_mut().filter(|i| i.label == TOOLBOX_LABEL) {
+            i.duplicate = false;
+        }
+        l.items.push(twin);
+        s.ask_startup(
+            TOOLBOX_LABEL,
+            "/Users/me/Library/LaunchAgents/elsewhere.plist",
+            crate::startup::Action::Disable,
+        );
+    });
+    let ask = rt.state.startup.confirm.clone().expect("the twin asks");
+    assert_eq!(ask.item.display_name(), "Twin");
+    assert_eq!(
+        ask.item.plist_path,
+        "/Users/me/Library/LaunchAgents/elsewhere.plist"
+    );
+    assert!(fake.calls().is_empty());
+}
+
+#[test]
+fn quit_shortcut_does_not_reach_a_hidden_process_row_on_the_startup_page() {
+    let (mut rt, _) = scene(sample_scene);
+    press(&mut rt, "all");
+    let id = "p:1300";
+    press(&mut rt, id);
+    assert_eq!(rt.state.table.cursor(), Some(id));
+    assert_eq!(rt.state.shortcut_target(), Some(1300), "on the list it has one");
+    rt.update(|s, _| s.show(Nav::Startup));
+    assert_eq!(rt.state.shortcut_target(), None);
 }

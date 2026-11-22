@@ -75,8 +75,12 @@ What it shows:
   - Disable and Enable, for your own launch agents only (`~/Library/LaunchAgents`, not Apple's,
     not a label two plists share): only on a press, behind a confirmation that names the item
     and its label and says what changes. Disabling stops it starting at login or on its own until
-    you enable it, and Spectra also unloads it, so if it's running it stops. Cancel has focus, Esc
-    cancels, and one press sends one `spectra startup disable|enable <label> --json --scope user`.
+    you enable it, and Spectra also unloads it, so if it's loaded it's unloaded and if it's
+    running it stops. Enabling says it will start at your next login, and that it starts now only
+    when it isn't loaded. Cancel has focus, Esc cancels, and one press sends one
+    `spectra startup disable|enable --json --scope user -- <label>`. Buttons stay off until the
+    re-read shows the result, and quitting waits a moment for a change, then leaves it to finish
+    rather than stopping it half done.
     The outcome is Spectra's own: done, refused (and why), or didn't take, and the list is read
     again. System items say "Needs an administrator; Spectra Desktop doesn't run sudo"; login
     items say to use System Settings › General › Login Items.

@@ -559,7 +559,7 @@ impl App {
     /// Re-cuts the list after a reading, a sidebar choice, a search, a sort or a group opening.
     pub fn rebuild(&mut self) {
         let q = self.query.text.trim().to_lowercase();
-        let nav = if matches!(self.nav, Nav::Overview | Nav::System) { Nav::All } else { self.nav };
+        let nav = if matches!(self.nav, Nav::Overview | Nav::System | Nav::Startup) { Nav::All } else { self.nav };
         let kept: Vec<&Process> = self
             .procs
             .iter()
@@ -805,7 +805,7 @@ impl App {
             Some(_) => None,
             // An app page hides the list and its cursor.
             None if self.app_page.is_some() => None,
-            None if !matches!(self.nav, Nav::Overview | Nav::System) => self.cursor_target(),
+            None if !matches!(self.nav, Nav::Overview | Nav::System | Nav::Startup) => self.cursor_target(),
             None => None,
         }
     }

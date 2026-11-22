@@ -19,15 +19,28 @@ use crate::run::{Ended, run_until};
 /// How long a listing may take. Spectra's own limit is two minutes; a listing takes a second or
 /// two, a few with Apple's items.
 pub const LIST_DEADLINE: Duration = Duration::from_secs(60);
-/// How long a disable or enable may take, its re-read included.
-pub const CHANGE_DEADLINE: Duration = Duration::from_secs(60);
+/// How long a disable or enable may take. Longer than Spectra's own two-minute limit, so Spectra
+/// always ends a change itself and this never kills one half done.
+pub const CHANGE_DEADLINE: Duration = Duration::from_secs(150);
 /// The most a command may print.
 const MAX_OUTPUT: usize = 16 << 20;
 /// Rows drawn before "and N more": Apple's items alone are nearly a thousand.
 pub const MAX_ROWS: usize = 200;
 
-/// Set when the app quits: a listing or change in flight is killed.
+/// Set when the app quits: a listing in flight is killed. A change is not (see [`cancel_for`]).
 pub static CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// Never set: what a change in flight watches instead of [`CANCEL`].
+static NEVER: AtomicBool = AtomicBool::new(false);
+
+/// The flag that stops a run of `spectra <args>`. A read stops at quit; a disable or enable
+/// doesn't, since killing it can leave an agent disabled but still loaded. Quit waits a moment
+/// for it, then leaves it running to finish on its own.
+pub fn cancel_for(args: &[String]) -> &'static AtomicBool {
+    let read = args.first().map(String::as_str) != Some("startup")
+        || args.get(1).map(String::as_str) == Some("list");
+    if read { &CANCEL } else { &NEVER }
+}
 
 /// What a command printed and how it exited. A change prints its JSON even when it was
 /// refused (exit 3) or didn't take (exit 1), so stdout is kept whatever the exit.
@@ -58,7 +71,7 @@ impl Runner for SpectraBin {
         let bin = std::env::var("SPECTRA_BIN").unwrap_or_else(|_| "spectra".into());
         let mut cmd = Command::new(&bin);
         cmd.args(args);
-        let out = run_until(cmd, deadline, MAX_OUTPUT, &CANCEL).map_err(|e| match e {
+        let out = run_until(cmd, deadline, MAX_OUTPUT, cancel_for(args)).map_err(|e| match e {
             Ended::Cancelled => format!("{bin} was stopped"),
             Ended::Failed(e) => crate::procs::run_failure(&bin, e),
         })?;
@@ -628,15 +641,17 @@ impl Action {
         }
     }
 
-    /// The command for `label`: user scope, always.
+    /// The command for `label`: user scope, always. The flags end with `--`, so a label that
+    /// starts with `-` is never read as one.
     pub fn args(self, label: &str) -> Vec<String> {
         vec![
             "startup".into(),
             self.arg().into(),
-            label.into(),
             "--json".into(),
             "--scope".into(),
             "user".into(),
+            "--".into(),
+            label.into(),
         ]
     }
 }
@@ -667,26 +682,18 @@ impl Ask {
                     lines.push(format!(
                         "It's running now{pid}. Disabling also unloads it, which stops it."
                     ));
+                } else if self.item.loaded {
+                    lines.push("It's loaded. Disabling also unloads it.".into());
                 }
                 lines
             }
-            Action::Enable => vec![format!(
-                "{name} ({label}) can start again. Spectra loads it now; it starts {}.",
-                when(&self.item)
-            )],
+            Action::Enable => {
+                let now = if self.item.loaded { "" } else { " and starts now" };
+                vec![format!(
+                    "{name} ({label}) can start again. It will start at your next login{now}."
+                )]
+            }
         }
-    }
-}
-
-/// When an enabled item starts, in words.
-fn when(i: &Item) -> String {
-    if i.triggers.contains(&Trigger::Login) || i.triggers.contains(&Trigger::KeepAlive) {
-        "now and at each login".into()
-    } else {
-        format!(
-            "when launchd next starts it ({})",
-            i.trigger_text().to_lowercase()
-        )
     }
 }
 
@@ -855,6 +862,9 @@ pub struct Startup {
     pub not_apple: bool,
     pub confirm: Option<Ask>,
     pub outcome: Option<ChangeOutcome>,
+    /// A change has landed and the re-read that shows its effect hasn't: the rows still show the
+    /// state from before it.
+    settling: bool,
     read_job: u64,
     change_job: u64,
     tx: Sender<Landed>,
@@ -875,6 +885,7 @@ impl Startup {
             not_apple: true,
             confirm: None,
             outcome: None,
+            settling: false,
             read_job: 0,
             change_job: 0,
             tx,
@@ -887,6 +898,11 @@ impl Startup {
         self.outcome
             .as_ref()
             .is_some_and(|o| o.status == ChangeStatus::Sending)
+    }
+
+    /// Whether a change is on its way or its effect isn't on screen yet: no other can start.
+    pub fn busy(&self) -> bool {
+        self.sending() || self.settling
     }
 
     /// The listing's items the filters keep.
@@ -904,12 +920,14 @@ impl Startup {
             .unwrap_or_default()
     }
 
-    pub fn item(&self, label: &str) -> Option<&Item> {
+    /// The changeable item a row stands for: its label and the plist it came from, so two
+    /// rows sharing a label can't act on each other.
+    pub fn item(&self, label: &str, plist_path: &str) -> Option<&Item> {
         self.listing
             .as_ref()?
             .items
             .iter()
-            .find(|i| i.label == label && i.kind != Kind::Service)
+            .find(|i| i.label == label && i.plist_path == plist_path && i.kind != Kind::Service)
     }
 }
 
@@ -1050,6 +1068,7 @@ impl App {
             match l {
                 Landed::Read { job, result } if job == st.read_job => {
                     st.reading = false;
+                    st.settling = false;
                     match result {
                         Ok(listing) => {
                             st.listing = Some(listing);
@@ -1075,6 +1094,7 @@ impl App {
                     // Whatever launchd did, the list should show it.
                     if changed {
                         st.reading = false;
+                        st.settling = true;
                         self.read_startup();
                     }
                 }
@@ -1100,13 +1120,13 @@ impl App {
     /// Opens the confirmation for changing `label`, as it is in the listing. It never changes
     /// anything itself, and opens nothing for an item that can't be changed or while another
     /// change is open or on its way.
-    pub fn ask_startup(&mut self, label: &str, action: Action) {
+    pub fn ask_startup(&mut self, label: &str, plist_path: &str, action: Action) {
         let st = &mut self.startup;
-        if st.confirm.is_some() || st.sending() {
+        if st.confirm.is_some() || st.busy() {
             return;
         }
         let Some(item) = st
-            .item(label)
+            .item(label, plist_path)
             .filter(|i| i.change_refusal().is_none())
             .cloned()
         else {
@@ -1162,7 +1182,7 @@ impl App {
 
     /// Dismisses the change's outcome, except while it's on its way.
     pub fn dismiss_startup_outcome(&mut self) {
-        if !self.startup.sending() {
+        if !self.startup.busy() {
             self.startup.outcome = None;
         }
     }
@@ -1181,6 +1201,8 @@ pub(crate) mod tests {
         pub list: Result<Ran, String>,
         pub services: Result<Ran, String>,
         pub change: Result<Ran, String>,
+        /// A list waits for this lock: a test holds it to keep a re-read in flight.
+        pub gate: Arc<Mutex<()>>,
     }
 
     pub fn ok(stdout: &str) -> Result<Ran, String> {
@@ -1198,6 +1220,7 @@ pub(crate) mod tests {
                 list: ok(LIST),
                 services: ok(SERVICES),
                 change: ok(crate::sample_startup::DISABLED_JSON),
+                gate: Arc::new(Mutex::new(())),
             }
         }
 
@@ -1218,7 +1241,10 @@ pub(crate) mod tests {
         fn run(&self, args: &[String], _: Duration) -> Result<Ran, String> {
             self.calls.lock().unwrap().push(args.to_vec());
             match (args[0].as_str(), args.get(1).map(String::as_str)) {
-                ("startup", Some("list")) => self.list.clone(),
+                ("startup", Some("list")) => {
+                    drop(self.gate.lock());
+                    self.list.clone()
+                }
                 ("services", _) => self.services.clone(),
                 _ => self.change.clone(),
             }
@@ -1534,5 +1560,52 @@ pub(crate) mod tests {
         assert_eq!(calls[0], ["startup", "list", "--json", "--scope", "all"]);
         assert_eq!(calls[1], ["services", "--json", "--domain", "all"]);
         assert_eq!(calls[2].last().map(String::as_str), Some("--include-apple"));
+    }
+
+    #[test]
+    fn a_change_puts_its_flags_before_the_label_and_ends_them() {
+        for label in ["com.example.x", "--", "-x", "--json"] {
+            assert_eq!(
+                Action::Disable.args(label),
+                ["startup", "disable", "--json", "--scope", "user", "--", label]
+            );
+            assert_eq!(
+                Action::Enable.args(label),
+                ["startup", "enable", "--json", "--scope", "user", "--", label]
+            );
+        }
+    }
+
+    #[test]
+    fn quit_stops_a_read_but_not_a_change() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let quit = &CANCEL;
+        assert!(std::ptr::eq(
+            cancel_for(&args(&["startup", "list", "--json"])),
+            quit
+        ));
+        assert!(std::ptr::eq(cancel_for(&args(&["services", "--json"])), quit));
+        for action in [Action::Disable, Action::Enable] {
+            let flag = cancel_for(&action.args("-x"));
+            assert!(!std::ptr::eq(flag, quit), "a change isn't killed at quit");
+            assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
+        }
+        assert!(CHANGE_DEADLINE > Duration::from_secs(120));
+    }
+
+    #[test]
+    fn the_confirmation_says_when_it_starts_and_what_unloads() {
+        let mut item = by(&listing(), "com.jetbrains.toolbox").clone();
+        let ask = |item: &Item, action| Ask { item: item.clone(), action }.consequence();
+        item.loaded = false;
+        item.running = false;
+        item.pid = None;
+        assert_eq!(ask(&item, Action::Enable).len(), 1);
+        assert!(ask(&item, Action::Enable)[0].ends_with("It will start at your next login and starts now."));
+        item.loaded = true;
+        assert!(ask(&item, Action::Enable)[0].ends_with("It will start at your next login."));
+        assert!(ask(&item, Action::Disable).iter().any(|l| l.contains("loaded") && l.contains("unloads")));
+        item.loaded = false;
+        assert_eq!(ask(&item, Action::Disable).len(), 1);
     }
 }

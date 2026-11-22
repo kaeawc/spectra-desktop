@@ -359,18 +359,18 @@ fn action(s: &App, item: &Item, refusal: Option<&'static str>, key: &str, k: &Ki
     } else {
         Action::Disable
     };
-    let busy = st.sending() || st.confirm.is_some();
+    let busy = st.busy() || st.confirm.is_some();
     let help = match refusal {
         Some(why) => why.to_owned(),
-        None if st.sending() => "Another change is on its way".to_owned(),
+        None if st.busy() => "Another change is on its way".to_owned(),
         None => format!("{} {}", act.verb(), item.display_name()),
     };
-    let label = item.label.clone();
+    let (label, plist) = (item.label.clone(), item.plist_path.clone());
     Button::new(act.verb())
         .variant(ButtonVariant::Outline)
         .disabled(refusal.is_some() || busy)
         .help(help)
-        .on_press(move |s: &mut App| s.ask_startup(&label, act))
+        .on_press(move |s: &mut App| s.ask_startup(&label, &plist, act))
         .build(k)
         .key(format!("{key}-act"))
 }
@@ -408,7 +408,7 @@ fn outcome(s: &App, k: &Kit) -> Option<El> {
             .grow(1.0)
             .min_w(0.0),
     );
-    if o.status == ChangeStatus::Sending {
+    if s.startup.busy() {
         return Some(r);
     }
     Some(
