@@ -241,3 +241,64 @@ fn an_older_spectra_gets_a_plain_notice() {
     );
     assert!(has(&mut rt, "act-keep"));
 }
+
+#[test]
+fn a_reused_pid_does_not_link_to_another_process_page() {
+    let mut rt = scene(activity_scene);
+    // The feed lists 1311 as something else now: the event's pid was reused.
+    let id = rt
+        .state
+        .activity
+        .shown()
+        .iter()
+        .find(|e| e.pid == 1311 && e.kind == Kind::Start)
+        .unwrap()
+        .id();
+    assert!(rt.state.process(1311).is_some());
+    rt.update(|s, _| {
+        for e in s.activity.events.iter_mut().filter(|e| e.pid == 1311) {
+            e.name = "reused-name".into();
+        }
+    });
+    settle(&mut rt);
+    let (x, y) = locate(&mut rt, &format!("act-ev-{id}-open"));
+    rt.pointer_down(x, y);
+    rt.pointer_up(x, y);
+    settle(&mut rt);
+    assert_ne!(rt.state.selected, Some(1311), "no link: the name differs");
+}
+
+#[test]
+fn own_readings_hide_by_default_and_a_switch_shows_them() {
+    let mut rt = scene(activity_scene);
+    let all = rt.state.activity.events.len();
+    rt.update(|s, _| {
+        let mut e = s.activity.events[0].clone();
+        e.pid = 777_001;
+        e.own = true;
+        s.activity.push([e]);
+    });
+    settle(&mut rt);
+    assert!(rt.state.activity.shown().iter().all(|e| e.pid != 777_001));
+    assert!(
+        text_of(&rt, "act-count")
+            .unwrap()
+            .ends_with(&format!("of {all} events")),
+        "{:?}",
+        text_of(&rt, "act-count")
+    );
+    press(&mut rt, "act-own");
+    assert!(rt.state.activity.show_own);
+    assert!(rt.state.activity.shown().iter().any(|e| e.pid == 777_001));
+}
+
+#[test]
+fn the_page_says_what_the_checks_can_miss() {
+    let mut rt = scene(activity_scene);
+    assert!(has(&mut rt, "act-blindspot"));
+    let t = text_of(&rt, "act-blindspot").unwrap();
+    assert!(
+        t.contains("250 ms") && t.contains("every second") && t.contains("can be missed"),
+        "{t}"
+    );
+}

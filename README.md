@@ -67,17 +67,26 @@ What it shows:
   "Short-lived only" keeps processes that lived under 2 s. Above it, the last minute: starts,
   exits, and the five parents that started the most ("bash · 1110 started 214 processes"), each
   opening that process's page, with "Show only these" to filter the table to its children.
-  - Recording: `spectra spawns --json --interval 250ms --duration 10s` in back-to-back rounds on
-    a thread of its own, each with a 30 s deadline, **only while the page is open** (a process
-    page opened over it counts as leaving). "Keep recording" (off at start) keeps it going on
-    every page. Leaving the page or quitting stops the round in flight. A process that lives less
-    than 250 ms can be missed, as can one in the moment between two rounds; lifetimes are
-    approximate because start times have 1 s resolution. The latest 5000 events are kept.
+  - Recording: `spectra spawns --json --interval 250ms --duration 10s` in rounds on a thread of
+    its own, each with a 30 s deadline, with a 1 s rest between rounds, **only while the page is
+    open** (a process page opened over it counts as leaving). "Keep recording" (off at start)
+    keeps it going on every other page, checking once a second (`--interval 1s`) because looking
+    every 250 ms costs close to half a core; it uses some CPU. Leaving the page or quitting stops
+    the round in flight. A process that starts and ends between two checks (250 ms on the page,
+    1 s in the background) can be missed, as can one in the rest between rounds; the page says
+    so under its header. Lifetimes are approximate because start times have 1 s resolution. The
+    latest 5000 events are kept.
+  - Spectra Desktop's own readings (what it starts to look at the machine) are hidden from the
+    table, the last-minute summary and the storm finding; "Show Spectra Desktop's own readings"
+    (off) brings them back. "Short-lived only" matches a start to its exit by pid and start
+    time, so a reused pid doesn't borrow another process's lifetime. A pid links to its process
+    page only when the process list has that pid under the same name.
   - A failed round says why and the next starts 10 s later. An older Spectra without
     `spectra spawns` gets a plain notice and is asked again a minute later.
   - A finding on the Overview when one parent starts more than 100 processes in a minute (a
-    spawn storm), opening Activity filtered to that parent. It needs recording to be on: the
-    page open, or Keep recording.
+    spawn storm), opening Activity filtered to that parent. The finding appears only while
+    recording is on (the page open, or Keep recording): with both off nothing is watching, so
+    there is nothing to find.
 - **All processes**, then by kind and by runtime in the sidebar, with live counts. Sort by CPU,
   memory or name; search by name, pid, bundle id or path. The table only builds the rows on
   screen, so the full list stays quick. Rows group an app with its helpers, and processes of one

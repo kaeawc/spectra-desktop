@@ -65,7 +65,7 @@ fn ensure_stop(why: &str) -> String {
 fn controls(s: &App, k: &Kit) -> El {
     let a = &s.activity;
     let note = if a.keep_recording {
-        "On: recording continues on every page until you turn this off."
+        "On: keeps recording on other pages, checking once a second; uses some CPU."
     } else {
         "Off: recording runs only while this page is open."
     };
@@ -76,7 +76,8 @@ fn controls(s: &App, k: &Kit) -> El {
         .build(k)
         .key("act-keep");
     let status = if a.recording() {
-        let mut line = format!("Recording in rounds of {ROUND_SECS} s, looking every {INTERVAL}.");
+        let every = a.interval().unwrap_or(INTERVAL);
+        let mut line = format!("Recording in rounds of {ROUND_SECS} s, looking every {every}.");
         if let Some(at) = a.updated {
             line.push_str(&format!(" Last round landed {} ago.", fmt_ago(s.now - at)));
         }
@@ -146,7 +147,7 @@ fn last_minute(s: &App, k: &Kit) -> El {
             fmt_count(p.count as u64)
         );
         let key = format!("act-parent-{ppid}");
-        let who = if s.process(ppid).is_some() {
+        let who = if lives(s, ppid, &p.name) {
             text(line)
                 .key(key.clone())
                 .role("link")
@@ -210,10 +211,16 @@ fn events(s: &App, k: &Kit) -> El {
         .on_toggle(|s: &mut App| s.activity.short_only = !s.activity.short_only)
         .build(k)
         .key("act-short");
+    let own = Switch::new(a.show_own)
+        .label("Show Spectra Desktop's own readings")
+        .description("What this app starts to look at your machine")
+        .on_toggle(|s: &mut App| s.toggle_show_own())
+        .build(k)
+        .key("act-own");
     let count = format!(
         "{} of {} events",
         fmt_count(shown.len() as u64),
-        fmt_count(a.events.len() as u64)
+        fmt_count(a.events.iter().filter(|e| a.counts(e)).count() as u64)
     );
     let mut bar = row()
         .w_full()
@@ -221,7 +228,8 @@ fn events(s: &App, k: &Kit) -> El {
         .center_y()
         .flex_wrap()
         .child(search)
-        .child(short);
+        .child(short)
+        .child(own);
     if let Some(ppid) = a.parent {
         let name = a
             .events
@@ -264,7 +272,18 @@ fn events(s: &App, k: &Kit) -> El {
             .font(k.ty.small)
             .color(c.text_muted),
     );
-    let mut body = col().key("act-events").w_full().gap(12.0).child(bar);
+    let mut body = col()
+        .key("act-events")
+        .w_full()
+        .gap(12.0)
+        .child(
+            text("Checks every 250 ms (every second while recording in the background); a process that starts and ends between checks, or between rounds, can be missed.")
+            .key("act-blindspot")
+            .font(k.ty.small)
+            .color(c.text_muted)
+            .wrap(),
+        )
+        .child(bar);
     if a.events.is_empty() {
         let (title, line) = if a.recording() {
             (
@@ -354,6 +373,12 @@ fn table(s: &App, shown: &[&Event], k: &Kit) -> El {
     table
 }
 
+/// Whether the process feed lists `pid` under `name`: a reused pid is some other process, and
+/// its page isn't this event's.
+fn lives(s: &App, pid: u32, name: &str) -> bool {
+    !name.is_empty() && s.process(pid).is_some_and(|p| p.name() == name)
+}
+
 /// A process as `name · pid`: a link to its page while the process feed lists it.
 fn who(s: &App, key: String, name: &str, pid: u32, link: bool, w: f32, k: &Kit) -> El {
     let c = &k.c;
@@ -363,7 +388,7 @@ fn who(s: &App, key: String, name: &str, pid: u32, link: bool, w: f32, k: &Kit) 
         .w(w)
         .truncate()
         .font(k.ty.small);
-    if link && s.process(pid).is_some() {
+    if link && lives(s, pid, name) {
         let label = format!("Open {name}");
         t.role("link")
             .label(label)

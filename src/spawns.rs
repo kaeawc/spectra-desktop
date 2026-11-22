@@ -1,5 +1,5 @@
-//! Processes starting and exiting, live: `spectra spawns` polls the process table every 250 ms,
-//! so it sees the short-lived processes the 2 s process feed never lists. It runs in rounds of
+//! Processes starting and exiting, live: `spectra spawns` polls the process table every 250 ms
+//! (every second when only "Keep recording" runs it), so it sees the short-lived processes the 2 s process feed never lists. It runs in rounds of
 //! about 10 s, off the UI thread, only while the Activity page is open or "Keep recording" is
 //! on. What it saw lands in a ring buffer of the latest events, with a summary of the last
 //! minute and a finding when one parent starts processes faster than anyone would by hand.
@@ -22,10 +22,17 @@ use crate::inspect::{Failure, Spectra};
 pub const MAX_EVENTS: usize = 5000;
 /// How long one round traces, in seconds.
 pub const ROUND_SECS: u64 = 10;
-/// How often Spectra looks at the process table during a round.
+/// How often Spectra looks at the process table during a round while the Activity page is open.
 pub const INTERVAL: &str = "250ms";
+/// The same while only "Keep recording" runs rounds: about a quarter of the CPU.
+pub const INTERVAL_BACKGROUND: &str = "1s";
+/// How long to rest, in seconds, between two good rounds.
+pub const REST: f64 = 1.0;
 /// How long one round may take before it's stopped: its trace and a margin.
 const ROUND_DEADLINE: Duration = Duration::from_secs(ROUND_SECS + 20);
+/// How far a start's time may be from its exit's start estimate beyond the exit's own error, in
+/// milliseconds: a start is seen up to one check after it happened.
+const START_SLACK_MS: i64 = 1500;
 /// The most a round may print.
 const MAX_OUTPUT: usize = 16 << 20;
 /// A process that exited sooner than this after it started is short-lived, in milliseconds.
@@ -78,6 +85,8 @@ pub struct Event {
     pub lifetime_err_ms: Option<i64>,
     /// Its command line, when the process feed listed the pid as the event landed.
     pub command_line: String,
+    /// Started by Spectra Desktop itself (its own readings), directly or further up.
+    pub own: bool,
 }
 
 impl Event {
@@ -190,6 +199,7 @@ fn event(v: &Value) -> Option<Event> {
         lifetime_ms: int(v, "lifetime_ms"),
         lifetime_err_ms: int(v, "lifetime_max_error_ms"),
         command_line: String::new(),
+        own: false,
     })
 }
 
@@ -214,9 +224,9 @@ pub fn parse(out: &str) -> Result<Vec<Event>, String> {
     Ok(events)
 }
 
-/// `spectra spawns` for one round of `secs` seconds.
-pub fn args(secs: u64) -> Vec<String> {
-    ["spawns", "--json", "--interval", INTERVAL, "--duration"]
+/// `spectra spawns` for one round of `secs` seconds, looking every `interval`.
+pub fn args(secs: u64, interval: &str) -> Vec<String> {
+    ["spawns", "--json", "--interval", interval, "--duration"]
         .iter()
         .map(|s| (*s).to_owned())
         .chain([format!("{secs}s")])
@@ -339,6 +349,7 @@ pub fn storms<'a>(events: impl IntoIterator<Item = &'a Event>, now: f64) -> Vec<
 /// A round in flight.
 struct Flight {
     job: u64,
+    interval: &'static str,
     cancel: Arc<AtomicBool>,
 }
 
@@ -351,6 +362,10 @@ pub struct Activity {
     /// Only the children of this parent, set by a summary row or the spawn-storm finding.
     pub parent: Option<u32>,
     pub short_only: bool,
+    /// Also list, count and watch for storms in what Spectra Desktop's own readings started.
+    pub show_own: bool,
+    /// This app's pid: what its own readings descend from.
+    pub me: u32,
     /// The open row, by `Event::id`.
     pub expanded: Option<String>,
     /// What went wrong with the last round; cleared by a good one.
@@ -415,6 +430,8 @@ impl Activity {
             query: TextEdit::new(""),
             parent: None,
             short_only: false,
+            show_own: false,
+            me: std::process::id(),
             expanded: None,
             error: None,
             updated: None,
@@ -450,8 +467,19 @@ impl Activity {
         self.job += 1;
         self.flight = Some(Flight {
             job: self.job,
+            interval: INTERVAL,
             cancel: Arc::new(AtomicBool::new(false)),
         });
+    }
+
+    /// How often the round in flight looks, if one is running.
+    pub fn interval(&self) -> Option<&'static str> {
+        self.flight.as_ref().map(|f| f.interval)
+    }
+
+    /// Whether the table, summary and storms count `e`: not an own reading, unless asked for.
+    pub fn counts(&self, e: &Event) -> bool {
+        self.show_own || !e.own
     }
 
     /// Stops the round in flight, if any. Its result, when it comes, is dropped.
@@ -465,23 +493,29 @@ impl Activity {
     /// or parent pid), the parent filter and "Short-lived only" applied.
     pub fn shown(&self) -> Vec<&Event> {
         let q = self.query.text.trim().to_lowercase();
-        let short: HashSet<u32> = if self.short_only {
-            self.events
-                .iter()
-                .filter(|e| e.short_lived())
-                .map(|e| e.pid)
-                .collect()
-        } else {
-            HashSet::new()
+        // A short exit's process began at its time minus its lifetime; a start belongs to it
+        // only if it began about then, so a reused pid doesn't borrow another's lifetime.
+        let mut short: HashMap<u32, Vec<(i64, i64)>> = HashMap::new();
+        if self.short_only {
+            for e in self.events.iter().filter(|e| e.short_lived()) {
+                let began = (e.at * 1000.0).round() as i64 - e.lifetime_ms.unwrap_or(0);
+                let slack = e.lifetime_err_ms.unwrap_or(0) + START_SLACK_MS;
+                short.entry(e.pid).or_default().push((began, slack));
+            }
+        }
+        let started_short = |e: &Event| {
+            let at = (e.at * 1000.0).round() as i64;
+            short
+                .get(&e.pid)
+                .is_some_and(|v| v.iter().any(|(began, slack)| (at - began).abs() <= *slack))
         };
         self.events
             .iter()
             .rev()
+            .filter(|e| self.counts(e))
             .filter(|e| self.parent.is_none_or(|p| e.ppid == p))
             .filter(|e| {
-                !self.short_only
-                    || e.short_lived()
-                    || e.kind == Kind::Start && short.contains(&e.pid)
+                !self.short_only || e.short_lived() || e.kind == Kind::Start && started_short(e)
             })
             .filter(|e| {
                 q.is_empty()
@@ -495,13 +529,26 @@ impl Activity {
 
     /// The last minute before Unix time `now`.
     pub fn summary(&self, now: f64) -> Summary {
-        summary(&self.events, now, WINDOW)
+        summary(self.events.iter().filter(|e| self.counts(e)), now, WINDOW)
     }
 
     /// Spawn storms in the minute before Unix time `now`.
     pub fn findings(&self, now: f64) -> Vec<Finding> {
-        storms(&self.events, now)
+        storms(self.events.iter().filter(|e| self.counts(e)), now)
     }
+}
+
+/// Whether `pid`'s parents in the process feed lead to `ancestor`.
+fn descends_from(s: &App, pid: u32, ancestor: u32) -> bool {
+    let mut at = pid;
+    for _ in 0..64 {
+        match s.process(at) {
+            Some(p) if p.ppid == ancestor => return true,
+            Some(p) if p.ppid > 1 => at = p.ppid,
+            _ => return false,
+        }
+    }
+    false
 }
 
 impl App {
@@ -531,11 +578,19 @@ impl App {
     }
 
     fn start_round(&mut self) {
+        // Looking every 250 ms costs about four times the CPU of every second: only while the page
+        // is on screen.
+        let interval = if self.activity_open() {
+            INTERVAL
+        } else {
+            INTERVAL_BACKGROUND
+        };
         let a = &mut self.activity;
         a.job += 1;
         let (job, cancel) = (a.job, Arc::new(AtomicBool::new(false)));
         a.flight = Some(Flight {
             job,
+            interval,
             cancel: Arc::clone(&cancel),
         });
         let (spectra, tx, wake) = (Arc::clone(&a.spectra), a.tx.clone(), self.wake.clone());
@@ -545,7 +600,8 @@ impl App {
         let started = std::thread::Builder::new()
             .name("spectra-spawns".into())
             .spawn(move || {
-                let result = match spectra.run(&args(ROUND_SECS), ROUND_DEADLINE, &cancel) {
+                let result = match spectra.run(&args(ROUND_SECS, interval), ROUND_DEADLINE, &cancel)
+                {
                     Ok(out) => parse(&out).map_err(Fail::Failed),
                     Err(Failure::Cancelled) => Err(Fail::Stopped),
                     Err(Failure::Failed(why)) => Err(classify(&why)),
@@ -575,6 +631,23 @@ impl App {
         a.flight = None;
         match r.result {
             Ok(mut events) => {
+                // Own readings: what descends from this app, by the pids this round and the
+                // buffer saw it start, and by the process feed's parents for older ones.
+                let me = self.activity.me;
+                let mut own: HashSet<u32> = self
+                    .activity
+                    .events
+                    .iter()
+                    .filter(|e| e.own)
+                    .map(|e| e.pid)
+                    .collect();
+                for e in &mut events {
+                    e.own =
+                        e.ppid == me || own.contains(&e.ppid) || descends_from(self, e.ppid, me);
+                    if e.own {
+                        own.insert(e.pid);
+                    }
+                }
                 for e in &mut events {
                     if let Some(p) = self.process(e.pid).filter(|p| p.name() == e.name) {
                         e.command_line = p.full_command_line.clone();
@@ -585,7 +658,7 @@ impl App {
                 a.error = None;
                 a.updated = Some(self.now);
                 a.rounds += 1;
-                a.next = self.now;
+                a.next = self.now + REST;
             }
             Err(Fail::Stopped) => return false,
             Err(fail) => {
@@ -607,6 +680,11 @@ impl App {
         self.activity.parent = Some(ppid);
         self.activity.query = TextEdit::new("");
         self.activity.expanded = None;
+    }
+
+    pub fn toggle_show_own(&mut self) {
+        self.activity.show_own = !self.activity.show_own;
+        self.refresh_findings();
     }
 
     pub fn toggle_keep_recording(&mut self) {
@@ -659,6 +737,7 @@ pub mod tests {
             lifetime_ms,
             lifetime_err_ms: None,
             command_line: String::new(),
+            own: false,
         }
     }
 
@@ -941,9 +1020,9 @@ pub mod tests {
         s.tick_activity();
         assert!(s.activity.recording());
         wait_for("the round started", || calls(&fake) == 1);
-        assert_eq!(fake.calls.lock().unwrap()[0], args(ROUND_SECS));
+        assert_eq!(fake.calls.lock().unwrap()[0], args(ROUND_SECS, INTERVAL));
         assert_eq!(
-            args(10).join(" "),
+            args(10, "250ms").join(" "),
             "spawns --json --interval 250ms --duration 10s"
         );
         s.tick_activity();
@@ -980,6 +1059,12 @@ pub mod tests {
         s.tick_activity();
         assert!(s.activity.recording(), "recording from the overview");
         wait_for("started", || calls(&fake) == 1);
+        assert_eq!(
+            fake.calls.lock().unwrap()[0],
+            args(ROUND_SECS, INTERVAL_BACKGROUND),
+            "off the page it looks once a second"
+        );
+        assert_eq!(s.activity.interval(), Some("1s"));
         // What `on_quit` does.
         s.activity.cancel();
         wait_for("quit cancels", || fake.cancelled.load(Ordering::SeqCst));
@@ -987,20 +1072,115 @@ pub mod tests {
     }
 
     #[test]
-    fn a_landed_round_fills_the_buffer_and_the_next_starts_at_once() {
+    fn the_page_being_open_decides_the_interval_not_keep_recording() {
+        let (mut s, fake) = faked(None);
+        s.toggle_keep_recording();
+        s.show(Nav::Activity);
+        s.tick_activity();
+        wait_for("started", || calls(&fake) == 1);
+        assert_eq!(
+            fake.calls.lock().unwrap()[0],
+            args(ROUND_SECS, "250ms"),
+            "open page, even with Keep recording on"
+        );
+        assert_eq!(s.activity.interval(), Some("250ms"));
+        s.activity.cancel();
+    }
+
+    #[test]
+    fn a_landed_round_fills_the_buffer_and_the_next_waits_a_second() {
         let (mut s, fake) = faked(Some(Ok(FIXTURE.to_owned())));
         s.show(Nav::Activity);
         s.tick_activity();
         land(&mut s);
         assert_eq!(s.activity.events.len(), 5);
         assert_eq!(s.activity.rounds, 1);
-        assert!(
-            s.activity.recording(),
-            "the next round started straight away"
-        );
+        assert!(!s.activity.recording(), "it rests between rounds");
+        assert_eq!(s.activity.next, s.now + REST);
+        s.now += REST - 0.1;
+        s.tick_activity();
+        assert!(!s.activity.recording(), "still resting");
+        assert_eq!(calls(&fake), 1);
+        s.now += 0.1;
+        s.tick_activity();
+        assert!(s.activity.recording(), "then the next round starts");
         land(&mut s);
         assert_eq!(s.activity.events.len(), 10);
-        assert!(calls(&fake) >= 2);
+        assert_eq!(calls(&fake), 2);
+    }
+
+    #[test]
+    fn short_lived_only_does_not_match_a_reused_pid_by_number_alone() {
+        let mut a = Activity::new();
+        // pid 10 ran 0.4 s at t=2; the pid was reused at t=500 by a long-running process.
+        a.push([
+            ev(Kind::Start, 1.6, 10, 1, "git", "zsh", None),
+            ev(Kind::Exit, 2.0, 10, 1, "git", "zsh", Some(400)),
+            ev(Kind::Start, 500.0, 10, 1, "vim", "zsh", None),
+        ]);
+        a.short_only = true;
+        let kept: Vec<(Kind, f64)> = a.shown().iter().map(|e| (e.kind, e.at)).collect();
+        assert_eq!(kept, vec![(Kind::Exit, 2.0), (Kind::Start, 1.6)]);
+    }
+
+    #[test]
+    fn own_readings_are_hidden_from_table_summary_and_storms_until_asked_for() {
+        let mut a = Activity::new();
+        let mut mine: Vec<Event> = (0..=STORM as u32)
+            .map(|i| {
+                ev(
+                    Kind::Start,
+                    100.0,
+                    5000 + i,
+                    77,
+                    "spectra",
+                    "Spectra Desktop",
+                    None,
+                )
+            })
+            .collect();
+        mine.iter_mut().for_each(|e| e.own = true);
+        a.push(mine);
+        a.push([ev(Kind::Start, 100.0, 9, 1, "git", "zsh", None)]);
+        assert_eq!(a.shown().len(), 1, "only the other process");
+        assert_eq!(a.summary(101.0).starts, 1);
+        assert!(a.findings(101.0).is_empty(), "no storm from own readings");
+        a.show_own = true;
+        assert_eq!(a.shown().len(), STORM + 2);
+        assert_eq!(a.summary(101.0).starts, STORM + 2);
+        assert_eq!(a.findings(101.0).len(), 1);
+    }
+
+    #[test]
+    fn landing_marks_what_descends_from_this_app() {
+        let mut s = crate::app::init();
+        s.activity.me = 4000;
+        s.activity.job = 1;
+        s.activity.flight = Some(Flight {
+            job: 1,
+            interval: INTERVAL,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        let evs = vec![
+            ev(
+                Kind::Start,
+                1.0,
+                4100,
+                4000,
+                "spectra",
+                "Spectra Desktop",
+                None,
+            ),
+            ev(Kind::Start, 1.1, 4101, 4100, "ps", "spectra", None),
+            ev(Kind::Exit, 1.2, 4101, 4100, "ps", "spectra", Some(100)),
+            ev(Kind::Start, 1.3, 9, 1, "git", "zsh", None),
+        ];
+        assert!(s.land_round(Round {
+            job: 1,
+            result: Ok(evs)
+        }));
+        let own: Vec<bool> = s.activity.events.iter().map(|e| e.own).collect();
+        assert_eq!(own, [true, true, true, false]);
     }
 
     #[test]
@@ -1046,6 +1226,7 @@ pub mod tests {
         s.activity.job = 1;
         s.activity.flight = Some(Flight {
             job: 1,
+            interval: INTERVAL,
             cancel: Arc::new(AtomicBool::new(false)),
         });
         let mut e = ev(Kind::Start, 1.0, p.pid, p.ppid, &p.name(), "zsh", None);
