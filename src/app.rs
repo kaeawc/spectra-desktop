@@ -297,6 +297,8 @@ pub struct App {
     pub poke_rx: Option<Receiver<()>>,
     /// The machine-wide readings the System page shows.
     pub system: crate::system::System,
+    /// Processes starting and exiting, for the Activity page.
+    pub activity: crate::spawns::Activity,
 }
 
 pub fn init() -> App {
@@ -357,6 +359,7 @@ pub fn init() -> App {
         poke: Some(poke),
         poke_rx: Some(poke_rx),
         system: crate::system::System::new(),
+        activity: crate::spawns::Activity::new(),
     }
 }
 
@@ -487,6 +490,7 @@ impl App {
             .flat_map(|j| diagnose(j, &self.history(j.pid)))
             .chain(self.proc_findings.iter().cloned())
             .chain(crate::system_findings::diagnose(&self.system, self.now))
+            .chain(self.activity.findings((self.wall)() as f64))
             .collect();
         all.sort_by_key(|f| (f.severity, f.pid));
         self.findings = all;
@@ -623,6 +627,7 @@ impl App {
             Link::Process(pid) => self.open(pid),
             Link::Unidentified => self.show(Nav::Unidentified),
             Link::System => self.show(Nav::System),
+            Link::Activity(ppid) => self.show_activity_of(ppid),
         }
     }
 

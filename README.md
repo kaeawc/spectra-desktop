@@ -58,6 +58,26 @@ What it shows:
     throttled, and volumes over 90% full (critical from 97%). A pressure finding clears after three
     normal readings in a row, a volume finding once it is under 88%, and a part whose reading
     failed or is three rounds old has no finding.
+- **Activity**, right under Machine: processes starting and exiting, live, including the
+  short-lived ones the 2 s process list never sees. For when something keeps spawning and dying.
+  Newest first: time, Started or Exited, the process and its parent (each opens its page while the
+  process list has it), how long an exited one lived, and its command line when the process list
+  saw it (else the chain of parents that started it). Click a row for the whole command line,
+  every parent up to launchd, and how sure the lifetime is. Filter by name, pid or parent;
+  "Short-lived only" keeps processes that lived under 2 s. Above it, the last minute: starts,
+  exits, and the five parents that started the most ("bash · 1110 started 214 processes"), each
+  opening that process's page, with "Show only these" to filter the table to its children.
+  - Recording: `spectra spawns --json --interval 250ms --duration 10s` in back-to-back rounds on
+    a thread of its own, each with a 30 s deadline, **only while the page is open** (a process
+    page opened over it counts as leaving). "Keep recording" (off at start) keeps it going on
+    every page. Leaving the page or quitting stops the round in flight. A process that lives less
+    than 250 ms can be missed, as can one in the moment between two rounds; lifetimes are
+    approximate because start times have 1 s resolution. The latest 5000 events are kept.
+  - A failed round says why and the next starts 10 s later. An older Spectra without
+    `spectra spawns` gets a plain notice and is asked again a minute later.
+  - A finding on the Overview when one parent starts more than 100 processes in a minute (a
+    spawn storm), opening Activity filtered to that parent. It needs recording to be on: the
+    page open, or Keep recording.
 - **All processes**, then by kind and by runtime in the sidebar, with live counts. Sort by CPU,
   memory or name; search by name, pid, bundle id or path. The table only builds the rows on
   screen, so the full list stays quick. Rows group an app with its helpers, and processes of one
