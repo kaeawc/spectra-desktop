@@ -58,18 +58,32 @@ fn right_now_sits_above_the_numbers_with_its_age_and_one_line_per_cause() {
     let mut rt = scene(right_now_scene);
     let (now, summary) = (rt.find("right-now").unwrap(), rt.find("summary").unwrap());
     assert!(now.1 < summary.1, "at the top of the Overview");
-    assert_eq!(text_of(&mut rt, "right-now-age").as_deref(), Some("Checked 8 s ago"));
-    assert_eq!(text_of(&mut rt, "ww-0-title").as_deref(), Some("Memory pressure is elevated"));
+    assert_eq!(
+        text_of(&mut rt, "right-now-age").as_deref(),
+        Some("Checked 8 s ago")
+    );
+    assert_eq!(
+        text_of(&mut rt, "ww-0-title").as_deref(),
+        Some("Memory pressure is elevated")
+    );
     assert_eq!(
         text_of(&mut rt, "ww-1-title").as_deref(),
         Some("Visual Studio Code uses 16% of machine CPU")
     );
     assert_eq!(
         text_of(&mut rt, "ww-1-evidence").as_deref(),
-        Some("1.6 cores busy across 5 processes, holding 2.3 GB; busiest: rust-analyzer at 138%, Code Helper (Plugin) at 12%.")
+        Some(
+            "1.6 cores busy across 5 processes, holding 2.3 GB; busiest: rust-analyzer at 138%, Code Helper (Plugin) at 12%."
+        )
     );
-    assert!(!has(&mut rt, "ww-2"), "rust-analyzer's heavy CPU is the editor's line already");
-    assert_eq!(text_of(&mut rt, "ww-1-open").as_deref(), Some("Visual Studio Code"));
+    assert!(
+        !has(&mut rt, "ww-2"),
+        "rust-analyzer's heavy CPU is the editor's line already"
+    );
+    assert_eq!(
+        text_of(&mut rt, "ww-1-open").as_deref(),
+        Some("Visual Studio Code")
+    );
     assert_eq!(text_of(&mut rt, "ww-0-open").as_deref(), Some("Machine"));
 }
 
@@ -77,7 +91,10 @@ fn right_now_sits_above_the_numbers_with_its_age_and_one_line_per_cause() {
 fn each_line_opens_the_page_that_shows_more() {
     let mut rt = scene(right_now_scene);
     press(&mut rt, "ww-1-open");
-    assert_eq!(rt.state.app_page.as_deref(), Some("/Applications/Visual Studio Code.app"));
+    assert_eq!(
+        rt.state.app_page.as_deref(),
+        Some("/Applications/Visual Studio Code.app")
+    );
     let mut rt = scene(right_now_scene);
     press(&mut rt, "ww-0-open");
     assert_eq!(rt.state.nav, Nav::System);
@@ -107,7 +124,10 @@ fn nothing_wrong_is_one_short_line() {
         Some("Nothing is slowing this Mac down right now.")
     );
     assert!(!has(&mut rt, "ww-0"));
-    assert_eq!(text_of(&mut rt, "right-now-age").as_deref(), Some("Checked 3 s ago"));
+    assert_eq!(
+        text_of(&mut rt, "right-now-age").as_deref(),
+        Some("Checked 3 s ago")
+    );
 }
 
 #[test]
@@ -136,7 +156,10 @@ fn a_look_shows_it_is_asking_then_lands() {
 #[test]
 fn a_first_look_that_fails_says_why() {
     let mut rt = scene(sample_scene);
-    let fake = Arc::new(Fake::with(&[("whatswrong", Err("spectra: unknown command \"whatswrong\""))]));
+    let fake = Arc::new(Fake::with(&[(
+        "whatswrong",
+        Err("spectra: unknown command \"whatswrong\""),
+    )]));
     rt.update(move |s, _| {
         s.whatswrong.spectra = fake;
         s.whatswrong.held = Some(Arc::new(Mutex::new(Vec::new())));

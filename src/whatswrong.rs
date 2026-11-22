@@ -90,7 +90,8 @@ pub struct Member {
 }
 
 pub fn parse(out: &str) -> Result<Report, String> {
-    serde_json::from_str(out).map_err(|e| format!("Spectra's answer didn't read as expected ({e})."))
+    serde_json::from_str(out)
+        .map_err(|e| format!("Spectra's answer didn't read as expected ({e})."))
 }
 
 pub fn args() -> Vec<String> {
@@ -217,11 +218,22 @@ pub fn items(r: &Report, findings: &[Finding], procs: &[Process]) -> Vec<Item> {
                 continue;
             }
             shown_pids.insert(pid);
-            let rule = if c.title.contains("memory") { "proc-memory-growth" } else { "proc-busy-cpu" };
-            let action = if procs.iter().any(|p| p.pid == pid) { Action::Process(pid) } else { Action::Machine };
+            let rule = if c.title.contains("memory") {
+                "proc-memory-growth"
+            } else {
+                "proc-busy-cpu"
+            };
+            let action = if procs.iter().any(|p| p.pid == pid) {
+                Action::Process(pid)
+            } else {
+                Action::Machine
+            };
             (c.detail.clone(), action, vec![format!("{pid}/{rule}")])
         } else {
-            let covers = machine_rules(&c.title).iter().map(|r| format!("0/{r}")).collect();
+            let covers = machine_rules(&c.title)
+                .iter()
+                .map(|r| format!("0/{r}"))
+                .collect();
             (c.detail.clone(), Action::Machine, covers)
         };
         covers.retain(|id| ids.contains(id));
@@ -232,8 +244,16 @@ pub fn items(r: &Report, findings: &[Finding], procs: &[Process]) -> Vec<Item> {
             .unwrap_or_default();
         out.push(Item {
             severity: severity(&c.severity),
-            title: if c.title.is_empty() { c.detail.clone() } else { c.title.clone() },
-            evidence: if c.title.is_empty() { String::new() } else { evidence },
+            title: if c.title.is_empty() {
+                c.detail.clone()
+            } else {
+                c.title.clone()
+            },
+            evidence: if c.title.is_empty() {
+                String::new()
+            } else {
+                evidence
+            },
             fix,
             action,
             covers,
@@ -330,11 +350,18 @@ impl App {
         let w = &self.whatswrong;
         let (_, at) = w.report.as_ref()?;
         let age = self.now - at;
-        let mut line = if age < 2.0 { "Checked just now".to_owned() } else { format!("Checked {} ago", fmt_ago(age)) };
+        let mut line = if age < 2.0 {
+            "Checked just now".to_owned()
+        } else {
+            format!("Checked {} ago", fmt_ago(age))
+        };
         if w.running() {
             line.push_str(" · checking again");
         } else if let Some(e) = &w.error {
-            line.push_str(&format!(" · the last check failed: {}", e.trim_end_matches('.')));
+            line.push_str(&format!(
+                " · the last check failed: {}",
+                e.trim_end_matches('.')
+            ));
         }
         Some(line)
     }
@@ -370,7 +397,10 @@ impl App {
         w.job += 1;
         let job = w.job;
         let cancel = Arc::new(AtomicBool::new(false));
-        w.flight = Some(Flight { job, cancel: Arc::clone(&cancel) });
+        w.flight = Some(Flight {
+            job,
+            cancel: Arc::clone(&cancel),
+        });
         let spectra = Arc::clone(&w.spectra);
         let work: Work = Box::new(move || {
             let result = match spectra.run(&args(), DEADLINE, &cancel) {
@@ -385,22 +415,28 @@ impl App {
             return;
         }
         let (tx, wake) = (w.tx.clone(), self.wake.clone());
-        let spawned = std::thread::Builder::new().name("spectra-whatswrong".into()).spawn({
-            let tx = tx.clone();
-            let wake = wake.clone();
-            move || {
-                let landed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|_| Landed {
-                    job,
-                    result: Err("Spectra Desktop hit an internal error reading it.".into()),
-                });
-                let _ = tx.send(landed);
-                if let Some(wake) = wake {
-                    wake();
+        let spawned = std::thread::Builder::new()
+            .name("spectra-whatswrong".into())
+            .spawn({
+                let tx = tx.clone();
+                let wake = wake.clone();
+                move || {
+                    let landed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                        .unwrap_or_else(|_| Landed {
+                            job,
+                            result: Err("Spectra Desktop hit an internal error reading it.".into()),
+                        });
+                    let _ = tx.send(landed);
+                    if let Some(wake) = wake {
+                        wake();
+                    }
                 }
-            }
-        });
+            });
         if spawned.is_err() {
-            let _ = tx.send(Landed { job, result: Err("Couldn't start a thread to ask Spectra.".into()) });
+            let _ = tx.send(Landed {
+                job,
+                result: Err("Couldn't start a thread to ask Spectra.".into()),
+            });
         }
     }
 
@@ -456,12 +492,20 @@ pub(crate) mod tests {
             detail: String::new(),
             fix: fix.into(),
             chart: Chart::None,
-            link: if pid == 0 { Link::System } else { Link::Process(pid) },
+            link: if pid == 0 {
+                Link::System
+            } else {
+                Link::Process(pid)
+            },
         }
     }
 
     fn cause(severity: &str, title: &str, detail: &str) -> Cause {
-        Cause { severity: severity.into(), title: title.into(), detail: detail.into() }
+        Cause {
+            severity: severity.into(),
+            title: title.into(),
+            detail: detail.into(),
+        }
     }
 
     #[test]
@@ -472,7 +516,10 @@ pub(crate) mod tests {
         assert_eq!(r.causes[0].title, "Build tools uses 52% of machine CPU");
         assert_eq!(r.families.len(), 4);
         let build = &r.families[0];
-        assert_eq!((build.kind.as_str(), build.members, build.heaviest[0].pid), ("build", 2, 18523));
+        assert_eq!(
+            (build.kind.as_str(), build.members, build.heaviest[0].pid),
+            ("build", 2, 18523)
+        );
         assert_eq!(r.families[3].name, "Google Chrome");
         assert!(r.trend.starts_with("load 5.80"));
     }
@@ -492,9 +539,16 @@ pub(crate) mod tests {
     #[test]
     fn a_family_and_its_busiest_process_are_one_line() {
         let r = parse(BUSY).unwrap();
-        let procs = vec![proc(18523, "java", 786.0, 1400.0), proc(12201, "java", 47.0, 2000.0)];
+        let procs = vec![
+            proc(18523, "java", 786.0, 1400.0),
+            proc(12201, "java", 47.0, 2000.0),
+        ];
         let got = items(&r, &[], &procs);
-        assert_eq!(got.len(), 1, "the heavy-CPU java is the build's busiest member: {got:?}");
+        assert_eq!(
+            got.len(),
+            1,
+            "the heavy-CPU java is the build's busiest member: {got:?}"
+        );
         assert_eq!(got[0].title, "Build tools uses 52% of machine CPU");
         assert_eq!(got[0].severity, Severity::Warning);
         assert_eq!(got[0].action, Action::Process(18523));
@@ -510,22 +564,54 @@ pub(crate) mod tests {
             name: "Google Chrome".into(),
             members: 9,
             cpu_pct: 420.0,
-            heaviest: vec![Member { pid: 60, command: "Google Chrome Helper (Renderer)".into(), cpu_pct: 300.0 }],
+            heaviest: vec![Member {
+                pid: 60,
+                command: "Google Chrome Helper (Renderer)".into(),
+                cpu_pct: 300.0,
+            }],
             ..Family::default()
         };
-        let r = Report { causes: vec![cause("medium", "Google Chrome uses 42% of machine CPU", "")], families: vec![f], ..Report::default() };
-        let helper = app(proc(60, "Google Chrome Helper (Renderer)", 300.0, 500.0), "Google Chrome", "/Applications/Google Chrome.app", Role::AppHelper);
-        assert_eq!(items(&r, &[], &[helper])[0].action, Action::App("/Applications/Google Chrome.app".into()));
-        assert_eq!(items(&r, &[], &[])[0].action, Action::Machine, "nobody listed to open");
+        let r = Report {
+            causes: vec![cause("medium", "Google Chrome uses 42% of machine CPU", "")],
+            families: vec![f],
+            ..Report::default()
+        };
+        let helper = app(
+            proc(60, "Google Chrome Helper (Renderer)", 300.0, 500.0),
+            "Google Chrome",
+            "/Applications/Google Chrome.app",
+            Role::AppHelper,
+        );
+        assert_eq!(
+            items(&r, &[], &[helper])[0].action,
+            Action::App("/Applications/Google Chrome.app".into())
+        );
+        assert_eq!(
+            items(&r, &[], &[])[0].action,
+            Action::Machine,
+            "nobody listed to open"
+        );
     }
 
     #[test]
     fn a_cause_that_repeats_a_finding_takes_its_place_and_its_fix() {
         let r = Report {
             causes: vec![
-                cause("high", "Memory pressure is critical", "swap in use: 9000 MB of 10240 MB"),
-                cause("medium", "A process is using heavy CPU", "rust-analyzer (pid 1300) at 138% CPU"),
-                cause("low", "A process is holding a lot of memory", "java (pid 4102) at 4.1 GB RSS"),
+                cause(
+                    "high",
+                    "Memory pressure is critical",
+                    "swap in use: 9000 MB of 10240 MB",
+                ),
+                cause(
+                    "medium",
+                    "A process is using heavy CPU",
+                    "rust-analyzer (pid 1300) at 138% CPU",
+                ),
+                cause(
+                    "low",
+                    "A process is holding a lot of memory",
+                    "java (pid 4102) at 4.1 GB RSS",
+                ),
                 cause("low", "Something else", "no pid here"),
             ],
             ..Report::default()
@@ -536,7 +622,10 @@ pub(crate) mod tests {
             finding(4102, "proc-busy-cpu", ""),
             finding(0, "sys-volume-full", ""),
         ];
-        let procs = vec![proc(1300, "rust-analyzer", 138.0, 1100.0), proc(4102, "java", 4.0, 4200.0)];
+        let procs = vec![
+            proc(1300, "rust-analyzer", 138.0, 1100.0),
+            proc(4102, "java", 4.0, 4200.0),
+        ];
         let got = items(&r, &findings, &procs);
         assert_eq!(got.len(), TOP, "at most three");
         assert_eq!(got[0].severity, Severity::Critical);
@@ -545,14 +634,20 @@ pub(crate) mod tests {
         assert_eq!(got[0].action, Action::Machine);
         assert_eq!(got[1].covers, ["1300/proc-busy-cpu"]);
         assert_eq!(got[1].action, Action::Process(1300));
-        assert!(got[2].covers.is_empty(), "holding memory isn't the same as busy CPU");
+        assert!(
+            got[2].covers.is_empty(),
+            "holding memory isn't the same as busy CPU"
+        );
         assert_eq!(got[2].action, Action::Process(4102));
     }
 
     #[test]
     fn a_family_covers_its_members_busy_findings() {
         let r = parse(BUSY).unwrap();
-        let findings = vec![finding(18523, "proc-busy-cpu", "Look at it."), finding(7, "proc-busy-cpu", "")];
+        let findings = vec![
+            finding(18523, "proc-busy-cpu", "Look at it."),
+            finding(7, "proc-busy-cpu", ""),
+        ];
         let got = items(&r, &findings, &[]);
         assert_eq!(got[0].covers, ["18523/proc-busy-cpu"]);
         assert_eq!(got[0].fix, "Look at it.");
@@ -560,7 +655,14 @@ pub(crate) mod tests {
 
     #[test]
     fn nothing_wrong_is_no_lines() {
-        assert!(items(&parse(CALM).unwrap(), &[finding(0, "sys-volume-full", "")], &[]).is_empty());
+        assert!(
+            items(
+                &parse(CALM).unwrap(),
+                &[finding(0, "sys-volume-full", "")],
+                &[]
+            )
+            .is_empty()
+        );
     }
 
     fn faked(reply: Result<&'static str, &'static str>) -> (App, Arc<Fake>) {
@@ -589,7 +691,10 @@ pub(crate) mod tests {
         s.now = 130.0;
         s.tick_whatswrong();
         assert!(s.whatswrong.running());
-        assert_eq!(s.right_now_age().as_deref(), Some("Checked 30 s ago · checking again"));
+        assert_eq!(
+            s.right_now_age().as_deref(),
+            Some("Checked 30 s ago · checking again")
+        );
     }
 
     #[test]
@@ -605,7 +710,10 @@ pub(crate) mod tests {
         s.tick_whatswrong();
         assert!(!s.whatswrong.running(), "leaving the Overview stops it");
         s.run_held_whatswrong();
-        assert!(s.whatswrong.report.is_none(), "what the stopped look said is dropped");
+        assert!(
+            s.whatswrong.report.is_none(),
+            "what the stopped look said is dropped"
+        );
         assert_eq!(fake.calls().len(), 1);
         // Back on the Overview it looks at once: nothing landed, so nothing is fresh.
         s.show(Nav::Overview);
@@ -619,12 +727,17 @@ pub(crate) mod tests {
         s.tick_whatswrong();
         s.run_held_whatswrong();
         assert!(s.whatswrong.report.is_none());
-        assert_eq!(s.whatswrong.error.as_deref(), Some("spectra took longer than 20 s and was stopped"));
+        assert_eq!(
+            s.whatswrong.error.as_deref(),
+            Some("spectra took longer than 20 s and was stopped")
+        );
         s.whatswrong.report = Some((parse(BUSY).unwrap(), 0.0));
         s.now = 40.0;
         assert_eq!(
             s.right_now_age().as_deref(),
-            Some("Checked 40 s ago · the last check failed: spectra took longer than 20 s and was stopped")
+            Some(
+                "Checked 40 s ago · the last check failed: spectra took longer than 20 s and was stopped"
+            )
         );
     }
 
@@ -643,7 +756,9 @@ pub(crate) mod tests {
     #[test]
     #[ignore]
     fn live_whatswrong_reads() {
-        let out = inspect::System.run(&args(), DEADLINE, &AtomicBool::new(false)).unwrap();
+        let out = inspect::System
+            .run(&args(), DEADLINE, &AtomicBool::new(false))
+            .unwrap();
         parse(&out).unwrap();
     }
 }
