@@ -297,6 +297,8 @@ pub struct App {
     pub poke_rx: Option<Receiver<()>>,
     /// The machine-wide readings the System page shows.
     pub system: crate::system::System,
+    /// What starts at login or boot, for the Startup page.
+    pub startup: crate::startup::Startup,
 }
 
 pub fn init() -> App {
@@ -357,6 +359,7 @@ pub fn init() -> App {
         poke: Some(poke),
         poke_rx: Some(poke_rx),
         system: crate::system::System::new(),
+        startup: crate::startup::Startup::new(),
     }
 }
 
@@ -572,6 +575,10 @@ impl App {
         self.select(None);
         self.table.clear_selection();
         self.rebuild();
+        // The Startup page reads what starts at login each time it opens.
+        if nav == Nav::Startup {
+            self.read_startup();
+        }
     }
 
     pub fn toggle_group(&mut self, id: &str) {

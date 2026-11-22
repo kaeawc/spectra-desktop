@@ -18,6 +18,8 @@ mod sample;
 mod sample_jvm;
 mod sample_system;
 mod signal;
+mod startup;
+mod sample_startup;
 mod system;
 mod system_findings;
 mod tools;
@@ -86,6 +88,7 @@ fn on_quit(s: &mut App, _: &mut Tx) {
     s.stop_recording_now();
     s.inspect.cancel_all();
     system::CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
+    startup::CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
     run::wait_idle(Duration::from_secs(2));
 }
 
@@ -107,6 +110,8 @@ fn poll(s: &mut App, clock: f64, tx: &mut Tx) -> bool {
     landed |= s.land_inspect();
     // Memory, thermal, load, power, disks and network, for the System page.
     landed |= s.land_system();
+    // What starts at login, and a Disable or Enable's answer, for the Startup page.
+    landed |= s.land_startup();
     s.tick_inspector();
     // A hung Spectra sends nothing, so look again on a timer to say the numbers are getting old;
     // an open page also looks for its next live round.
@@ -177,6 +182,9 @@ fn main() {
             ("system-pressure", sample_system::system_pressure_scene),
             ("system-failed", sample_system::system_failed_scene),
             ("system-linux", sample_system::system_linux_scene),
+            ("startup", sample_startup::startup_scene),
+            ("startup-confirm", sample_startup::startup_confirm_scene),
+            ("startup-failed", sample_startup::startup_failed_scene),
         ],
         setup: Some(setup),
         poll: Some(poll),
