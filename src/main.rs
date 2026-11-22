@@ -17,12 +17,14 @@ mod run;
 mod sample;
 mod sample_jvm;
 mod sample_system;
+mod sample_tree;
 mod signal;
 mod startup;
 mod sample_startup;
 mod system;
 mod system_findings;
 mod tools;
+mod tree;
 mod ui;
 
 use std::sync::mpsc::RecvTimeoutError;
@@ -185,6 +187,8 @@ fn main() {
             ("startup", sample_startup::startup_scene),
             ("startup-confirm", sample_startup::startup_confirm_scene),
             ("startup-failed", sample_startup::startup_failed_scene),
+            ("tree", sample_tree::tree_scene),
+            ("tree-search", sample_tree::tree_search_scene),
         ],
         setup: Some(setup),
         poll: Some(poll),
