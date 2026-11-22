@@ -201,9 +201,13 @@ fn family_action(f: &Family, procs: &[Process]) -> Action {
         .filter_map(|m| listed(procs, m.pid, &m.command).map(|p| (m, p)))
         .collect();
     members.sort_by(|a, b| b.0.cpu_pct.total_cmp(&a.0.cpu_pct));
-    if f.kind == "app"
-        && let Some(path) = members.iter().find_map(|(_, p)| p.bundle_path())
-    {
+    // Families that are an app and its helpers (Spectra's kinds; "app" is the samples'): open
+    // the app, even when its busiest member is a helper with no bundle of its own.
+    let app_like = matches!(
+        f.kind.as_str(),
+        "browser" | "xcode" | "simulator" | "emulator" | "app"
+    );
+    if app_like && let Some(path) = members.iter().find_map(|(_, p)| p.bundle_path()) {
         return Action::App(path.to_owned());
     }
     match members.first() {
@@ -346,8 +350,22 @@ pub fn plain(detail: &str, wall: i64) -> String {
     detail
         .split("; ")
         .filter_map(|p| plain_part(p, wall))
+        .map(|p| short_name(&p))
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// `/System/.../mds_stores (pid 412) averaged …` as `mds_stores (pid 412) averaged …`: Spectra
+/// names a process by `ps -o comm=`, which on macOS is its whole path.
+fn short_name(part: &str) -> String {
+    let Some(at) = part.find(" (pid ") else {
+        return part.to_owned();
+    };
+    let (name, rest) = part.split_at(at);
+    match name.rfind('/') {
+        Some(slash) if name.starts_with('/') => format!("{}{rest}", &name[slash + 1..]),
+        _ => part.to_owned(),
+    }
 }
 
 /// The rules of machine-wide findings a cause titled `title` repeats.
@@ -808,7 +826,7 @@ pub(crate) mod tests {
         );
         // An app's family opens the app, even when a child outside it is busier.
         let mut app_family = r.clone();
-        app_family.families[0].kind = "app".into();
+        app_family.families[0].kind = "browser".into();
         assert_eq!(
             items(
                 &app_family,
@@ -848,6 +866,21 @@ pub(crate) mod tests {
             0,
         );
         assert_eq!(got[0].action, Action::Process(1300));
+    }
+
+    #[test]
+    fn a_process_named_by_its_path_reads_by_its_name() {
+        assert_eq!(
+            plain(
+                "/System/Library/Frameworks/CoreServices.framework/Support/mds_stores (pid 412) averaged 96% CPU",
+                0
+            ),
+            "mds_stores (pid 412) averaged 96% CPU"
+        );
+        assert_eq!(
+            plain("java (pid 7) at 138% CPU", 0),
+            "java (pid 7) at 138% CPU"
+        );
     }
 
     #[test]
