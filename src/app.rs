@@ -666,8 +666,9 @@ impl App {
     pub fn tree_step(&mut self, right: bool) -> Option<String> {
         let at = self.table.cursor()?.strip_prefix("p:")?.parse::<u32>().ok()?;
         self.tree.index_of(at)?;
-        let open = self.tree_is_open(at);
         let has_children = self.tree_has_children(at);
+        // A branch whose children all ended shows no triangle: Left goes straight to the parent.
+        let open = has_children && self.tree_is_open(at);
         let parent = self.tree.parent_of(at);
         match (right, open) {
             (true, false) if has_children => {
