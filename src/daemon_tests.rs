@@ -801,3 +801,20 @@ fn the_first_call_waits_only_half_its_deadline_for_a_daemon_that_never_says_hell
     let took = at.elapsed();
     assert!(took < Duration::from_millis(180), "{took:?}");
 }
+
+#[test]
+fn a_call_no_route_names_never_waits_for_the_first_connection() {
+    // The daemon takes the connection and never says hello: the first connection hangs.
+    let g = Fake::silent();
+    let d = g.daemon();
+    let at = Instant::now();
+    assert!(
+        d.answer(&["sample", "-json", "7"], Duration::from_secs(10), &never())
+            .is_none()
+    );
+    assert!(
+        at.elapsed() < Duration::from_millis(20),
+        "{:?}",
+        at.elapsed()
+    );
+}

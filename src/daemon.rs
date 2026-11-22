@@ -523,7 +523,9 @@ impl Daemon {
         deadline: Duration,
         cancel: &AtomicBool,
     ) -> Option<Result<String, Error>> {
-        if management(args) {
+        // A call no daemon method could ever answer runs the CLI at once, even while the first
+        // connection is still being made.
+        if management(args) || !TABLE.iter().any(|e| args.starts_with(e.cli)) {
             return None;
         }
         let start = Instant::now();
@@ -732,11 +734,13 @@ fn read_loop(
 ) {
     for line in BufReader::new(stream).lines() {
         let Ok(line) = line else { break };
-        heard.fetch_add(1, Ordering::SeqCst);
         let Ok(mut v) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
         if let Some(id) = v.get("id").and_then(Value::as_u64) {
+            // Only replies count as the daemon answering: pushed samples keep coming from one
+            // that has stopped answering calls.
+            heard.fetch_add(1, Ordering::SeqCst);
             let reply = match v.get_mut("error").map(Value::take) {
                 Some(e) if !e.is_null() => Err(Error::Rpc {
                     code: e.get("code").and_then(Value::as_i64).unwrap_or(0),
