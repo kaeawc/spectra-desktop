@@ -333,9 +333,10 @@ pub struct App {
     pub confirm: Option<Confirm>,
     /// The last Quit or Force quit, until another replaces it or it's dismissed.
     pub outcome: Option<Outcome>,
-    /// Wakes the process feed for a reading now, after a signal.
-    pub poke: Option<Sender<()>>,
-    pub poke_rx: Option<Receiver<()>>,
+    /// Asks the process feed for a reading: `true` for one taken now, after a signal, rather
+    /// than the daemon's shared snapshot.
+    pub poke: Option<Sender<bool>>,
+    pub poke_rx: Option<Receiver<bool>>,
     /// The machine-wide readings the System page shows.
     pub system: crate::system::System,
     /// Processes starting and exiting, for the Activity page.
@@ -475,7 +476,7 @@ impl App {
         let rest = if matches!(feed, Err(ProcError::TooOld(_))) { RETRY_OLD } else { REFRESH };
         self.feeds.proc_next = self.now + rest.as_secs_f64();
         if std::mem::take(&mut self.feeds.proc_again) {
-            self.ask_procs();
+            self.ask_procs(true);
         }
         let procs = match feed {
             Ok(procs) if procs.is_empty() => {
@@ -1176,13 +1177,14 @@ impl App {
         if self.feeds.proc_out {
             self.feeds.proc_again = true;
         } else {
-            self.ask_procs();
+            self.ask_procs(true);
         }
     }
 
-    fn ask_procs(&mut self) {
+    /// Asks for a process reading: `fresh` for one taken now, not the shared snapshot.
+    fn ask_procs(&mut self, fresh: bool) {
         if let Some(poke) = &self.poke
-            && poke.send(()).is_ok()
+            && poke.send(fresh).is_ok()
         {
             self.feeds.proc_out = true;
         }
@@ -1225,7 +1227,7 @@ impl App {
         let mut due: Option<f64> = None;
         if !self.feeds.proc_out {
             if self.now >= self.feeds.proc_next {
-                self.ask_procs();
+                self.ask_procs(false);
             } else {
                 due = Some(self.feeds.proc_next);
             }
@@ -1318,8 +1320,25 @@ mod tests {
 
     /// How many readings each feed was asked for since the last look.
     fn asked(s: &App) -> (usize, usize) {
-        let n = |rx: &Option<Receiver<()>>| rx.as_ref().map_or(0, |rx| rx.try_iter().count());
+        fn n<T>(rx: &Option<Receiver<T>>) -> usize {
+            rx.as_ref().map_or(0, |rx| rx.try_iter().count())
+        }
         (n(&s.poke_rx), n(&s.jvm_go_rx))
+    }
+
+    #[test]
+    fn a_reading_after_a_signal_is_taken_now_and_the_cadence_reads_the_snapshot() {
+        let mut s = init();
+        let fresh = |s: &App| s.poke_rx.as_ref().unwrap().try_iter().collect::<Vec<_>>();
+        s.tick_feeds();
+        assert_eq!(fresh(&s), vec![false], "every {REFRESH:?}, the daemon's snapshot");
+        s.land_procs(Ok(vec![proc(1, "a", 1.0, 1.0)]));
+        s.poke_feed();
+        assert_eq!(fresh(&s), vec![true], "after a Quit, one taken now");
+        // Asked while one is out, the follow-up is taken now too.
+        s.poke_feed();
+        s.land_procs(Ok(vec![proc(1, "a", 1.0, 1.0)]));
+        assert_eq!(fresh(&s), vec![true]);
     }
 
     fn jvm_proc(pid: u32) -> Process {

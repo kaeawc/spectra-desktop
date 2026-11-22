@@ -25,13 +25,15 @@ measured may finish), and coming back reads at once.
 **Spectra's daemon.** Where the daemon (`~/.spectra/daemon.sock`, started with
 `spectra daemon start` if its socket is missing) already holds a reading, the app asks it on one
 long-lived connection instead of starting a `spectra` process. One table in `src/daemon.rs`
-decides, from the methods `daemon.status` lists: the process list from `process.list` (pushed
-by `process.subscribe`), JVMs from `jvm.list`, the load average from the host sample
+decides, from the methods `daemon.status` lists: the process list from `process.list` (asked
+every 2 s while the window shows, from the daemon's shared snapshot; taken fresh after a Quit or
+Kill), JVMs from `jvm.list`, the load average from the host sample
 `alerts.subscribe` pushes (else `watch.current`), and the Machine page's memory, thermal, power
 and network readings from `memory.current`, `thermal.current`, `power.current` and
 `network.current`. A daemon without a method, or none at all,
-leaves that call to the CLI as before; a daemon with the generic `exec` method takes every other
-call too, named by `spectra capabilities --json`.
+leaves that call to the CLI as before, and so does one error from it, for that call only. The
+connection is made on a thread of its own: a call never waits on another's reconnect, and waits
+at most half its deadline for one before the CLI runs it.
 
 Set `SPECTRA_BIN` if `spectra` isn't on `PATH`. A Spectra too old for `--classify` gets a notice
 saying so; the JVM views keep working.

@@ -12,6 +12,8 @@ struct Fake {
     path: PathBuf,
     calls: Arc<Mutex<Vec<(String, Value)>>>,
     conns: Arc<Mutex<Vec<UnixStream>>>,
+    /// Connections the fake still has open: accepted and not yet closed by the app.
+    open: Arc<AtomicUsize>,
 }
 
 /// A handler, typed so its closure takes any borrow.
@@ -36,20 +38,45 @@ impl Fake {
     }
 
     fn serve_at(path: PathBuf, methods: &[&str], handler: Handler) -> Fake {
+        Fake::serve_any(path, Some(methods), handler)
+    }
+
+    /// A daemon that takes connections and never answers anything, not even hello.
+    fn silent() -> Fake {
+        Fake::serve_any(socket(), None, h(|_, _| None))
+    }
+
+    fn serve_any(path: PathBuf, methods: Option<&[&str]>, handler: Handler) -> Fake {
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
-        let methods: Vec<String> = methods.iter().map(|m| (*m).to_owned()).collect();
+        let methods: Option<Vec<String>> =
+            methods.map(|m| m.iter().map(|m| (*m).to_owned()).collect());
         let (calls, conns) = (
             Arc::new(Mutex::new(Vec::new())),
             Arc::new(Mutex::new(Vec::new())),
         );
-        let (c, k) = (Arc::clone(&calls), Arc::clone(&conns));
+        let open = Arc::new(AtomicUsize::new(0));
+        let (c, k, o) = (Arc::clone(&calls), Arc::clone(&conns), Arc::clone(&open));
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { return };
                 lock(&k).push(stream.try_clone().unwrap());
-                let (c, handler, methods) = (Arc::clone(&c), Arc::clone(&handler), methods.clone());
+                o.fetch_add(1, Ordering::SeqCst);
+                let (c, handler, methods, o) = (
+                    Arc::clone(&c),
+                    Arc::clone(&handler),
+                    methods.clone(),
+                    Arc::clone(&o),
+                );
                 std::thread::spawn(move || {
+                    // Counted closed once the app's end of it closes.
+                    struct Closed(Arc<AtomicUsize>);
+                    impl Drop for Closed {
+                        fn drop(&mut self) {
+                            self.0.fetch_sub(1, Ordering::SeqCst);
+                        }
+                    }
+                    let _closed = Closed(o);
                     let mut out = stream.try_clone().unwrap();
                     for line in BufReader::new(stream).lines() {
                         let Ok(line) = line else { return };
@@ -60,7 +87,7 @@ impl Fake {
                         );
                         lock(&c).push((method.clone(), v["params"].clone()));
                         let reply = if method == "daemon.status" {
-                            Some(Ok(json!({"methods": methods})))
+                            methods.as_ref().map(|m| Ok(json!({"methods": m})))
                         } else {
                             handler(&method, &v["params"])
                         };
@@ -78,7 +105,12 @@ impl Fake {
                 });
             }
         });
-        Fake { path, calls, conns }
+        Fake {
+            path,
+            calls,
+            conns,
+            open,
+        }
     }
 
     fn calls(&self, method: &str) -> Vec<Value> {
@@ -111,6 +143,31 @@ impl Fake {
     fn daemon(&self) -> Daemon {
         Daemon::new(self.path.clone(), Box::new(|| {}))
     }
+
+    fn daemon_with(&self, timing: Timing) -> Daemon {
+        Daemon::with_timing(self.path.clone(), Box::new(|| {}), timing)
+    }
+}
+
+/// Waits for `cond`, up to two seconds.
+fn eventually(cond: impl Fn() -> bool) -> bool {
+    let since = Instant::now();
+    while !cond() {
+        if since.elapsed() > SEC {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
+}
+
+/// Connects `d`, waiting for it.
+fn connect(d: &Daemon) {
+    let since = Instant::now();
+    assert!(
+        eventually(|| matches!(d.link(since), Ready::Conn(_))),
+        "never connected"
+    );
 }
 
 fn never() -> AtomicBool {
@@ -120,7 +177,7 @@ fn never() -> AtomicBool {
 const SEC: Duration = Duration::from_secs(2);
 
 fn current(load1: f64) -> Value {
-    json!({"sample": {"load1": load1, "ncpu": 16, "memory_pressure": "normal"}, "active_alerts": []})
+    json!({"sample": {"at": "2026-11-22T00:00:00Z", "load1": load1, "ncpu": 16, "memory_pressure": "normal"}, "active_alerts": []})
 }
 
 fn set(methods: &[&str]) -> HashSet<String> {
@@ -128,11 +185,7 @@ fn set(methods: &[&str]) -> HashSet<String> {
 }
 
 fn routed(args: &[&str], methods: &[&str]) -> &'static str {
-    match route(args, &set(methods)) {
-        Route::Table(e) => e.method,
-        Route::Exec => EXEC,
-        Route::Cli => "cli",
-    }
+    route(args, &set(methods)).map_or("cli", |e| e.method)
 }
 
 #[test]
@@ -160,46 +213,14 @@ fn the_table_routes_a_call_to_the_daemon_only_while_it_lists_the_method() {
 }
 
 #[test]
-fn a_generic_exec_takes_every_call_the_table_does_not_name() {
-    let m = ["exec", "watch.current"];
-    assert_eq!(routed(&["memory", "--json"], &m), EXEC);
-    assert_eq!(routed(&["sample", "-json", "7"], &m), EXEC);
-    assert_eq!(
-        routed(&["load", "--json"], &m),
-        "watch.current",
-        "the table still wins"
-    );
-    // The daemon's own management never goes through the daemon.
+fn no_call_goes_to_a_generic_exec_yet() {
+    // A daemon listing `exec` still has every call the table doesn't name run the CLI.
+    let m = ["exec", "exec.cancel", "watch.current"];
+    assert_eq!(routed(&["owner", "--json", "7"], &m), "cli");
+    assert_eq!(routed(&["memory", "--json"], &m), "cli");
+    assert_eq!(routed(&["load", "--json"], &m), "watch.current");
     assert_eq!(routed(&["daemon", "start"], &m), "cli");
     assert_eq!(routed(&["capabilities", "--json"], &m), "cli");
-}
-
-#[test]
-fn names_the_capability_interface_a_call_invokes() {
-    let caps = parse_interfaces(
-        r#"{"interfaces":[{"name":"owner","argv":["owner","--json","[--timeout <duration>]","<target>"]},
-        {"name":"owner.under","argv":["owner","--under","--json","<dir>..."]},
-        {"name":"load","argv":["load","--json","[--top <n>]"]},
-        {"name":"jvm.gc","argv":["jvm","gc-stats","--json","<pid>"]},
-        {"name":"inspect","argv":["--json","<app_path>..."]}]}"#,
-    );
-    assert_eq!(
-        interface_name(&["owner", "--json", "7"], &caps),
-        Some("owner")
-    );
-    assert_eq!(
-        interface_name(&["owner", "--under", "--json", "/a"], &caps),
-        Some("owner.under")
-    );
-    assert_eq!(
-        interface_name(&["load", "--json", "--top", "1"], &caps),
-        Some("load")
-    );
-    assert_eq!(
-        interface_name(&["jvm", "gc-stats", "--json", "7"], &caps),
-        Some("jvm.gc")
-    );
-    assert_eq!(interface_name(&["vmmap", "7"], &caps), None);
 }
 
 #[test]
@@ -240,13 +261,17 @@ fn a_method_the_daemon_lacks_or_refuses_runs_the_cli() {
 fn no_daemon_runs_the_cli_and_starts_the_daemon_once() {
     let started = Arc::new(AtomicUsize::new(0));
     let s = Arc::clone(&started);
-    let d = Daemon::new(
+    let d = Daemon::with_timing(
         socket(),
         Box::new(move || {
             s.fetch_add(1, Ordering::SeqCst);
         }),
+        Timing {
+            start_wait: Duration::from_millis(200),
+            ..TIMING
+        },
     );
-    // START_WAIT passes with no socket; the next call doesn't try again for a while.
+    // The start wait passes with no socket; the next call doesn't try again for a while.
     assert!(d.answer(&["load", "--json"], SEC, &never()).is_none());
     let at = Instant::now();
     assert!(d.answer(&["load", "--json"], SEC, &never()).is_none());
@@ -313,9 +338,12 @@ fn a_pushed_host_sample_answers_without_asking() {
         }),
     );
     let d = f.daemon();
-    d.methods();
+    connect(&d);
     assert_eq!(f.calls("alerts.subscribe"), vec![json!({"samples": true})]);
-    f.push("watch.sample", json!({"load1": 7.25, "ncpu": 8}));
+    f.push(
+        "watch.sample",
+        json!({"at": "2026-11-22T00:00:00Z", "load1": 7.25, "ncpu": 8}),
+    );
     let since = Instant::now();
     while d.pushed_sample().is_none() && since.elapsed() < SEC {
         std::thread::sleep(Duration::from_millis(10));
@@ -348,7 +376,7 @@ fn the_process_feed_comes_from_the_shared_snapshot() {
 }
 
 #[test]
-fn the_process_feed_asks_for_classified_rows() {
+fn the_process_feed_asks_for_classified_rows_and_never_subscribes() {
     let f = Fake::serve(
         &["process.list", "process.subscribe"],
         h(|m, _| match m {
@@ -356,15 +384,52 @@ fn the_process_feed_asks_for_classified_rows() {
             _ => Some(Ok(rows("t", 1))),
         }),
     );
-    f.daemon()
-        .answer(&["process", "-json", "--classify"], SEC, &never())
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        f.calls("process.subscribe"),
-        vec![json!({"classify": true})]
+    let d = f.daemon();
+    let args = ["process", "-json", "--classify"];
+    d.answer(&args, SEC, &never()).unwrap().unwrap();
+    // Each reading asks; the same snapshot asked for twice is answered twice, at once.
+    let at = Instant::now();
+    d.answer(&args, SEC, &never()).unwrap().unwrap();
+    assert!(
+        at.elapsed() < Duration::from_millis(500),
+        "it didn't wait for a push"
     );
-    assert_eq!(f.calls("process.list"), vec![json!({"classify": true})]);
+    assert!(f.calls("process.subscribe").is_empty());
+    assert_eq!(
+        f.calls("process.list"),
+        vec![json!({"classify": true}), json!({"classify": true})]
+    );
+}
+
+#[test]
+fn after_a_quit_the_list_is_taken_now() {
+    let f = Fake::serve(&["process.list"], h(|_, _| Some(Ok(rows("t", 1)))));
+    let d = f.daemon();
+    let args = ["process", "-json", "--classify"];
+    fresh(|| d.answer(&args, SEC, &never())).unwrap().unwrap();
+    d.answer(&args, SEC, &never()).unwrap().unwrap();
+    assert_eq!(
+        f.calls("process.list"),
+        vec![
+            json!({"classify": true, "refresh": true}),
+            json!({"classify": true})
+        ]
+    );
+    // A daemon that refuses `refresh` gives its snapshot, and keeps the route.
+    let f = Fake::serve(
+        &["process.list"],
+        h(|_, p| {
+            Some(if p.get("refresh").is_some() {
+                Err((-32602, "invalid params".into()))
+            } else {
+                Ok(rows("t", 2))
+            })
+        }),
+    );
+    let d = f.daemon();
+    let out = fresh(|| d.answer(&args, SEC, &never())).unwrap().unwrap();
+    assert!(out.contains("\"pid\":2"), "{out}");
+    assert!(d.has("process.list"));
 }
 
 #[test]
@@ -387,14 +452,13 @@ fn a_daemon_that_does_not_classify_leaves_the_feed_to_the_cli() {
         1,
         "not asked again on every reading"
     );
-    // It refuses the flag as invalid params, and so its subscription doesn't count either.
+    // It refuses the flag as invalid params.
     let f = Fake::serve(
-        &["process.list", "process.subscribe"],
+        &["process.list"],
         h(|_, p| (p.get("classify").is_some()).then(|| Err((-32602, "invalid params".into())))),
     );
     let d = f.daemon();
     assert!(d.answer(&args, SEC, &never()).is_none());
-    assert!(!d.has("process.subscribe"));
     assert!(!d.has("process.list"));
 }
 
@@ -416,68 +480,6 @@ fn a_classification_that_failed_is_a_failed_reading_not_a_reason_to_stop() {
         Some(Err(Error::Warned("classify: timed out".into())))
     );
     assert!(d.has("process.list"), "it's asked again next time");
-}
-
-#[test]
-fn unclassified_pushes_are_not_landed() {
-    let f = Fake::serve(
-        &["process.list", "process.subscribe"],
-        h(|m, _| match m {
-            "process.subscribe" => Some(Ok(json!({"subscribed": true}))),
-            _ => Some(Ok(rows("2026-11-22T00:00:00Z", 1))),
-        }),
-    );
-    let d = f.daemon();
-    let args = ["process", "-json", "--classify"];
-    d.answer(&args, SEC, &never()).unwrap().unwrap();
-    f.push(
-        "process.update",
-        json!({"sampled_at": "2026-11-22T00:00:15Z", "processes": [{"pid": 3, "command": "x"}]}),
-    );
-    // Nothing classified came, so after waiting it asks again.
-    let out = d
-        .answer(&args, Duration::from_millis(400), &never())
-        .unwrap()
-        .unwrap();
-    assert!(!out.contains("\"pid\":3"), "{out}");
-    assert_eq!(f.calls("process.list").len(), 2);
-}
-
-#[test]
-fn subscribed_process_lists_are_pushed_and_never_landed_twice() {
-    let f = Fake::serve(
-        &["process.list", "process.subscribe"],
-        h(|m, _| match m {
-            "process.subscribe" => Some(Ok(json!({"subscribed": true}))),
-            _ => Some(Ok(rows("2026-11-22T00:00:00Z", 1))),
-        }),
-    );
-    let d = f.daemon();
-    let args = ["process", "-json", "--classify"];
-    // The first comes at once, asked for.
-    let first = d.answer(&args, SEC, &never()).unwrap().unwrap();
-    assert!(first.contains("\"pid\":1"));
-    assert_eq!(f.calls("process.list").len(), 1);
-    // The next waits for a newer push rather than handing the same list out again.
-    let pusher = {
-        let conns = Arc::clone(&f.conns);
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(200));
-            for c in lock(&conns).iter_mut() {
-                let msg = json!({"jsonrpc": "2.0", "method": "process.update", "params": rows("2026-11-22T00:00:15Z", 2)});
-                let _ = writeln!(c, "{msg}");
-            }
-        })
-    };
-    let at = Instant::now();
-    let second = d.answer(&args, SEC, &never()).unwrap().unwrap();
-    pusher.join().unwrap();
-    assert!(second.contains("\"pid\":2"), "{second}");
-    assert!(
-        at.elapsed() >= Duration::from_millis(150),
-        "it waited for the push"
-    );
-    assert_eq!(f.calls("process.list").len(), 1, "the push answered it");
 }
 
 #[test]
@@ -507,65 +509,6 @@ fn the_jvm_list_is_read_in_either_shape() {
         f.daemon().answer(&["jvm", "-json"], SEC, &never()),
         Some(Ok("[]".into()))
     );
-}
-
-fn exec_daemon(f: &Fake) -> Daemon {
-    let d = f.daemon();
-    let _ = d.interfaces.set(vec![(
-        "owner".into(),
-        vec!["owner".into(), "--json".into(), "<target>".into()],
-    )]);
-    d
-}
-
-#[test]
-fn exec_runs_a_cli_interface_in_the_daemon() {
-    let f = Fake::serve(
-        &["exec"],
-        h(|_, _| Some(Ok(json!({"stdout": "{\"pid\":7}"})))),
-    );
-    let d = exec_daemon(&f);
-    let out = d
-        .answer(&["owner", "--json", "7"], SEC, &never())
-        .unwrap()
-        .unwrap();
-    assert_eq!(out, "{\"pid\":7}");
-    let sent = &f.calls("exec")[0];
-    assert_eq!(sent["interface"], "owner");
-    assert_eq!(sent["args"], json!(["owner", "--json", "7"]));
-    assert_eq!(sent["timeout_ms"], 2000);
-    // An interface the capabilities don't name runs the CLI.
-    assert!(d.answer(&["vmmap", "7"], SEC, &never()).is_none());
-}
-
-#[test]
-fn a_cancelled_exec_is_cancelled_in_the_daemon_too() {
-    let f = Fake::serve(
-        &["exec", "exec.cancel"],
-        h(|m, _| (m == "exec.cancel").then_some(Ok(Value::Null))),
-    );
-    let d = exec_daemon(&f);
-    let cancel = Arc::new(AtomicBool::new(false));
-    let c = Arc::clone(&cancel);
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(150));
-        c.store(true, Ordering::SeqCst);
-    });
-    assert_eq!(
-        d.answer(&["owner", "--json", "7"], Duration::from_secs(10), &cancel),
-        Some(Err(Error::Cancelled))
-    );
-    let since = Instant::now();
-    while f.calls("exec.cancel").is_empty() && since.elapsed() < SEC {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let exec_id = lock(&f.calls)
-        .iter()
-        .position(|(m, _)| m == "exec")
-        .map(|i| i as u64 + 1);
-    assert_eq!(f.calls("exec.cancel").len(), 1);
-    // Ids count from 1 on this connection, in the order the fake recorded them.
-    assert_eq!(f.calls("exec.cancel")[0]["id"].as_u64(), exec_id);
 }
 
 #[test]
@@ -608,7 +551,7 @@ fn the_machine_readings_route_to_the_daemon_only_while_it_lists_them() {
         assert_eq!(routed(&args, &all), method);
         assert_eq!(routed(&args, &[method]), method);
         assert_eq!(routed(&args, &[]), "cli", "{method} unlisted runs the CLI");
-        assert_eq!(routed(&args, &["exec"]), EXEC);
+        assert_eq!(routed(&args, &["exec"]), "cli");
     }
     // The Network page's windows are another call.
     assert_eq!(
@@ -705,4 +648,156 @@ fn a_machine_reading_the_daemon_does_not_list_or_garbles_runs_the_cli() {
     assert!(d.answer(&["power", "--json"], SEC, &never()).is_none());
     assert!(d.answer(&["power", "--json"], SEC, &never()).is_none());
     assert_eq!(f.calls("power.current").len(), 1);
+}
+
+#[test]
+fn one_failed_call_does_not_take_the_route_away() {
+    // A transient error (the daemon's own internal error) runs the CLI this once only.
+    let failed = Arc::new(AtomicBool::new(false));
+    let once = Arc::clone(&failed);
+    let f = Fake::serve(
+        &["memory.current"],
+        h(move |_, _| {
+            Some(if once.swap(true, Ordering::SeqCst) {
+                Ok(json!({"physical_bytes": 1}))
+            } else {
+                Err((-32000, "collector busy".into()))
+            })
+        }),
+    );
+    let d = f.daemon();
+    let args = ["memory", "--json"];
+    assert!(d.answer(&args, SEC, &never()).is_none(), "the CLI runs it");
+    assert!(d.has("memory.current"));
+    assert!(d.answer(&args, SEC, &never()).unwrap().is_ok());
+    assert_eq!(f.calls("memory.current").len(), 2);
+    // Method not found does take it away, until the next connection.
+    let f = Fake::serve(
+        &["memory.current"],
+        h(|_, _| Some(Err((-32601, "method not found".into())))),
+    );
+    let d = f.daemon();
+    assert!(d.answer(&args, SEC, &never()).is_none());
+    assert!(d.answer(&args, SEC, &never()).is_none());
+    assert_eq!(f.calls("memory.current").len(), 1);
+}
+
+#[test]
+fn a_host_sample_not_taken_yet_runs_the_cli_and_asks_again() {
+    // Before its first sample the daemon answers zeros.
+    let zero = json!({"sample": {"at": "0001-01-01T00:00:00Z", "load1": 0.0, "ncpu": 0}, "active_alerts": []});
+    let f = reading_daemon("watch.current", zero);
+    let d = f.daemon();
+    assert!(d.answer(&["load", "--json"], SEC, &never()).is_none());
+    assert!(d.answer(&["load", "--json"], SEC, &never()).is_none());
+    assert_eq!(f.calls("watch.current").len(), 2, "asked again each time");
+    assert!(d.has("watch.current"));
+    // CPUs but a zero time, or no time at all, is no sample either.
+    for sample in [
+        json!({"at": "0001-01-01T00:00:00Z", "load1": 1.0, "ncpu": 8}),
+        json!({"load1": 1.0, "ncpu": 8}),
+        json!({"at": "2026-11-22T00:00:00Z", "load1": 1.0, "ncpu": 0}),
+    ] {
+        assert!(!taken(&sample), "{sample}");
+    }
+    // A pushed one not taken yet doesn't answer either.
+    let f = Fake::serve(
+        &["watch.current", "alerts.subscribe"],
+        h(|m, _| match m {
+            "alerts.subscribe" => Some(Ok(json!({"subscribed": true}))),
+            _ => Some(Ok(current(4.0))),
+        }),
+    );
+    let d = f.daemon();
+    connect(&d);
+    f.push(
+        "watch.sample",
+        json!({"at": "0001-01-01T00:00:00Z", "ncpu": 0}),
+    );
+    assert!(eventually(|| lock(&d.s.sample).is_some()));
+    assert!(d.pushed_sample().is_none());
+    let out = d
+        .answer(&["load", "--json"], SEC, &never())
+        .unwrap()
+        .unwrap();
+    assert!(out.contains("4.0"), "{out}");
+}
+
+#[test]
+fn a_failed_hello_leaves_no_thread_or_connection_behind() {
+    let f = Fake::silent();
+    let d = f.daemon_with(Timing {
+        hello: Duration::from_millis(50),
+        retry: Duration::ZERO,
+        ..TIMING
+    });
+    // Once the first hello failed the methods are known (none), so a call doesn't wait for the
+    // next attempt: each is given time to fail.
+    for _ in 0..5 {
+        assert!(d.answer(&["load", "--json"], SEC, &never()).is_none());
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    let n = lock(&f.conns).len();
+    assert!(n >= 5, "it dialled each time: {n}");
+    assert!(
+        eventually(|| d.s.readers.load(Ordering::SeqCst) == 0),
+        "{} reader threads left",
+        d.s.readers.load(Ordering::SeqCst)
+    );
+    assert!(
+        eventually(|| f.open.load(Ordering::SeqCst) == 0),
+        "{} connections left open",
+        f.open.load(Ordering::SeqCst)
+    );
+}
+
+#[test]
+fn a_call_keeps_its_deadline_while_a_reconnect_is_stuck() {
+    let f = reading_daemon("watch.current", current(1.0));
+    let d = f.daemon();
+    assert!(
+        d.answer(&["load", "--json"], SEC, &never())
+            .unwrap()
+            .is_ok()
+    );
+    // The daemon restarts as one that takes the connection and never says hello.
+    f.stop();
+    let g = Fake::serve_any(f.path.clone(), None, h(|_, _| None));
+    assert!(eventually(|| d.s.readers.load(Ordering::SeqCst) == 0));
+    let at = Instant::now();
+    let r = d.answer(&["load", "--json"], Duration::from_millis(200), &never());
+    assert!(matches!(r, None | Some(Err(Error::Timeout))), "{r:?}");
+    assert!(
+        at.elapsed() < Duration::from_millis(250),
+        "{:?}",
+        at.elapsed()
+    );
+    assert!(lock(&d.s.link).connecting, "the reconnect is still stuck");
+    // A call the daemon never answered goes to the CLI without waiting at all.
+    let at = Instant::now();
+    assert!(
+        d.answer(&["sample", "-json", "7"], Duration::from_secs(10), &never())
+            .is_none()
+    );
+    assert!(at.elapsed() < Duration::from_millis(20));
+    // And a cancelled one stops waiting.
+    let cancel = AtomicBool::new(true);
+    assert_eq!(
+        d.answer(&["load", "--json"], Duration::from_secs(10), &cancel),
+        Some(Err(Error::Cancelled))
+    );
+    drop(g);
+}
+
+#[test]
+fn the_first_call_waits_only_half_its_deadline_for_a_daemon_that_never_says_hello() {
+    let f = Fake::silent();
+    let d = f.daemon();
+    let at = Instant::now();
+    assert!(
+        d.answer(&["load", "--json"], Duration::from_millis(200), &never())
+            .is_none()
+    );
+    let took = at.elapsed();
+    assert!(took < Duration::from_millis(180), "{took:?}");
 }

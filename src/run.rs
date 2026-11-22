@@ -162,9 +162,14 @@ pub fn run(cmd: Command, deadline: Duration, cap: usize) -> Result<Output, RunEr
 /// own, and stopping it stops that group: its children go too, and nothing else.
 pub fn run_until(mut cmd: Command, deadline: Duration, cap: usize, cancel: &AtomicBool) -> Result<Output, Ended> {
     let _running = Running::new();
+    let start = Instant::now();
     // A call Spectra's daemon answers starts no process.
     if let Some(answer) = crate::daemon::answer(&cmd, deadline, cancel) {
         return daemon_output(answer, deadline, cap);
+    }
+    // Time spent waiting for a daemon that was connecting counts against the same deadline.
+    if start.elapsed() >= deadline {
+        return Err(Ended::Failed(RunError::Timeout(deadline)));
     }
     let mut child = cmd
         .process_group(0)
@@ -175,7 +180,6 @@ pub fn run_until(mut cmd: Command, deadline: Duration, cap: usize, cancel: &Atom
         .map_err(|e| Ended::Failed(RunError::Spawn(e.to_string())))?;
     let out = drain(child.stdout.take().expect("piped stdout"), cap);
     let err = drain(child.stderr.take().expect("piped stderr"), cap);
-    let start = Instant::now();
     let mut check = CHECK;
     let (mut stdout, mut stderr) = (None, None);
     let stop = |child: &mut std::process::Child, why: Ended| {
