@@ -267,6 +267,18 @@ pub enum Fail {
     Stopped,
 }
 
+/// What a finished run's output means. An older Spectra without `network top` reads `top` as a
+/// stray argument, stops parsing flags there (so `--json` is never seen), prints its human
+/// network summary and exits 0: output that isn't a JSON object is that, not a failure.
+pub fn read_top(out: &str) -> Result<Top, Fail> {
+    if !out.trim_start().starts_with('{') {
+        return Err(Fail::Unsupported(NO_TOP.into()));
+    }
+    parse_top(out).map_err(Fail::Failed)
+}
+
+const NO_TOP: &str = "This Spectra has no `spectra network top`. Update Spectra to see which processes use the network.";
+
 /// What a failed run means.
 pub fn classify(why: &str) -> Fail {
     let lower = why.to_ascii_lowercase();
@@ -275,10 +287,7 @@ pub fn classify(why: &str) -> Fail {
         || lower.contains("flag provided but not defined")
         || (lower.contains("stat ") && lower.contains("no such file"));
     if old {
-        Fail::Unsupported(
-            "This Spectra has no `spectra network top`. Update Spectra to see which processes use the network."
-                .into(),
-        )
+        Fail::Unsupported(NO_TOP.into())
     } else if lower.contains("not supported") || lower.contains("unsupported") {
         Fail::Unsupported("Spectra can't measure traffic per process on this system.".into())
     } else {
@@ -413,6 +422,8 @@ impl App {
             self.network.cancel();
         } else if self.network.flight.is_none() && self.now >= self.network.next {
             self.start_network_round();
+            // The status line now says a window is running: draw it.
+            landed = true;
         }
         landed
     }
@@ -433,7 +444,7 @@ impl App {
             .name("spectra-network-top".into())
             .spawn(move || {
                 let result = match spectra.run(&args(WINDOW_SECS), DEADLINE, &cancel) {
-                    Ok(out) => parse_top(&out).map_err(Fail::Failed),
+                    Ok(out) => read_top(&out),
                     Err(Failure::Cancelled) => Err(Fail::Stopped),
                     Err(Failure::Failed(why)) => Err(classify(&why)),
                 };
@@ -654,6 +665,13 @@ pub(crate) mod tests {
             classify("spectra: unknown subcommand \"top\""),
             Fail::Unsupported(_)
         ));
+        // Before `network top`, Spectra printed its human summary for `network top --json`
+        // and exited 0.
+        assert!(matches!(
+            read_top("Network\n  Default route: en0 via 192.168.1.1\n"),
+            Err(Fail::Unsupported(_))
+        ));
+        assert!(matches!(read_top("{ not json"), Err(Fail::Failed(_))));
         assert_eq!(
             classify("nettop: permission denied\n"),
             Fail::Failed("nettop: permission denied".into())
