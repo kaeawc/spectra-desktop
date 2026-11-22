@@ -79,6 +79,13 @@ fn text_of(rt: &mut Runtime<App>, key: &str) -> Option<String> {
         .and_then(|e| e.text)
 }
 
+/// Whether some element on screen reads exactly `label` (a button's text sits inside it).
+fn shows(rt: &Runtime<App>, label: &str) -> bool {
+    rt.elements()
+        .into_iter()
+        .any(|e| e.text.as_deref() == Some(label))
+}
+
 #[test]
 fn the_storage_row_opens_the_page_and_reads_only_time_machine() {
     let (mut rt, fake) = scene(sample_scene);
@@ -197,7 +204,28 @@ fn the_inside_scene_goes_one_deeper_and_back_says_where_to() {
         ]
     );
     land(&mut rt);
-    assert!(text_of(&mut rt, "st-back").is_none() || has(&mut rt, "st-back"));
+    assert!(shows(&rt, "‹ Back to ~/Library/Logs"));
+    press(&mut rt, "st-back");
+    assert_eq!(rt.state.storage.trail, ["/Users/me/Library/Logs"]);
+    assert_eq!(
+        text_of(&mut rt, "st-in-dir-0-name").as_deref(),
+        Some("CoreSimulator")
+    );
+}
+
+#[test]
+fn a_folder_never_measured_says_so_and_offers_measure() {
+    let (mut rt, _) = scene(storage_inside_scene);
+    rt.update(|s, _| {
+        s.storage.results.clear();
+    });
+    settle(&mut rt);
+    assert_eq!(
+        text_of(&mut rt, "st-inside-status").as_deref(),
+        Some("Not measured yet.")
+    );
+    assert!(shows(&rt, "Measure"));
+    assert!(!shows(&rt, "Measure again"));
 }
 
 #[test]

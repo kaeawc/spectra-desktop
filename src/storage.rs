@@ -336,6 +336,8 @@ pub struct Storage {
     tm_cancel: Arc<AtomicBool>,
     tm_job: u64,
     job: u64,
+    /// The "started … ago" last shown while measuring, so a tick redraws only when it changes.
+    shown: Option<String>,
     tx: Sender<Landed>,
     rx: Receiver<Landed>,
 }
@@ -357,6 +359,7 @@ impl Storage {
             tm_cancel: Arc::new(AtomicBool::new(false)),
             tm_job: 0,
             job: 0,
+            shown: None,
             tx,
             rx,
         }
@@ -411,6 +414,8 @@ fn submit(
         let _ = tx.send(work());
         return;
     }
+    // Quit waits for this from now until it's done, even before the thread starts.
+    let hold = crate::run::pending();
     let failed = Arc::new(Mutex::new(Some(failed)));
     let take = |f: &Mutex<Option<Landed>>| f.lock().ok().and_then(|mut f| f.take());
     let (on_panic, failed_tx, wake2) = (Arc::clone(&failed), tx.clone(), wake.clone());
@@ -419,6 +424,7 @@ fn submit(
         if let Some(l) = landed.ok().or_else(|| take(&on_panic)) {
             let _ = tx.send(l);
         }
+        drop(hold);
         if let Some(wake) = wake {
             wake();
         }
@@ -520,7 +526,19 @@ impl App {
 
     /// Back out of the open folder, to the one before it or to the top of the page.
     pub fn storage_back(&mut self) {
-        self.storage.trail.pop();
+        let Some(left) = self.storage.trail.pop() else {
+            return;
+        };
+        // A measurement of the folder just left, or of one inside it, has nothing on screen to
+        // show it: stop it rather than leave the page busy with no Stop.
+        let inside_it = |p: &str| {
+            p == left
+                || p.strip_prefix(left.as_str())
+                    .is_some_and(|r| r.starts_with('/'))
+        };
+        if self.storage.measuring_path().is_some_and(inside_it) {
+            self.stop_measuring();
+        }
     }
 
     /// Stops what's on its way: on leaving the page and on quit. Results from before stay.
@@ -538,6 +556,22 @@ impl App {
         if let Some(m) = self.storage.measuring.take() {
             m.cancel.store(true, Ordering::SeqCst);
         }
+    }
+
+    /// Lands what finished, and says whether anything shown changed: a landing, or the
+    /// "started … ago" of a measurement on its way now reading differently.
+    pub fn tick_storage(&mut self) -> bool {
+        let mut changed = self.land_storage();
+        let age = self
+            .storage
+            .measuring
+            .as_ref()
+            .map(|m| crate::app::fmt_ago(self.now - m.started));
+        if age != self.storage.shown {
+            self.storage.shown = age;
+            changed = true;
+        }
+        changed
     }
 
     /// Lands what the Storage workers finished. True when anything landed.
@@ -853,6 +887,37 @@ pub(crate) mod tests {
             "a stopped walk's answer is dropped"
         );
         assert!(s.storage.tm.is_none(), "so is the Time Machine read's");
+    }
+
+    #[test]
+    fn back_stops_a_measurement_of_the_folder_left_or_inside_it() {
+        let fake = Arc::new(Fake::new());
+        let mut s = app(fake);
+        s.storage.trail = vec!["/Users/me".into()];
+        s.storage.measuring = Some(Measuring::shown("/Users/me", 0.0));
+        let cancel = Arc::clone(&s.storage.measuring.as_ref().unwrap().cancel);
+        s.storage_back();
+        assert!(!s.storage.busy());
+        assert!(cancel.load(Ordering::SeqCst), "the walk is killed");
+        // Backing out of a deeper folder leaves a measurement of its parent running.
+        s.storage.trail = vec!["/Users/me".into(), "/Users/me/Library".into()];
+        s.storage.measuring = Some(Measuring::shown("/Users/me", 0.0));
+        s.storage_back();
+        assert!(s.storage.busy());
+    }
+
+    #[test]
+    fn the_tick_redraws_only_when_the_age_shown_changes() {
+        let fake = Arc::new(Fake::new());
+        let mut s = app(fake);
+        s.now = 100.0;
+        s.storage.measuring = Some(Measuring::shown("/Users/me/Library", 100.0));
+        assert!(s.tick_storage(), "first look at the age");
+        assert!(!s.tick_storage(), "same string");
+        s.now = 101.0;
+        assert!(s.tick_storage(), "a second later it reads differently");
+        s.now = 101.2;
+        assert!(!s.tick_storage());
     }
 
     #[test]

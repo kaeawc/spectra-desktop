@@ -145,8 +145,8 @@ fn poll(s: &mut App, clock: f64, tx: &mut Tx) -> bool {
     // "Right now": a look when the Overview opens, then every 30 s while it shows.
     landed |= s.tick_whatswrong();
     // A folder's size or Time Machine's snapshots, for the Storage page; while a folder is
-    // being measured, the page's "started … ago" keeps counting.
-    landed |= s.land_storage();
+    // being measured, the page's "started … ago" keeps counting (tick_storage says when it changed).
+    landed |= s.tick_storage();
     if s.overview_visible() || s.storage.busy() {
         tx.wake_after(STATUS_TICK);
     }

@@ -235,20 +235,33 @@ fn inside(s: &App, path: &str, k: &Kit) -> El {
         .build(k)
         .key("st-back");
     let p = path.to_owned();
-    let again = Button::new("Measure again")
-        .variant(ButtonVariant::Outline)
-        .disabled(st.busy())
-        .on_press(move |s: &mut App| s.measure_storage(&p))
-        .build(k)
-        .key("st-inside-measure");
-    let status = st.results.get(path).map_or(String::new(), |m| {
-        format!(
-            "{} in {} files · measured {} ago",
-            fmt_size(m.du.total),
-            fmt_count(m.du.files),
-            fmt_ago(s.now - m.at)
-        )
-    });
+    let again = Button::new(if st.results.contains_key(path) {
+        "Measure again"
+    } else {
+        "Measure"
+    })
+    .variant(ButtonVariant::Outline)
+    .disabled(st.busy())
+    .on_press(move |s: &mut App| s.measure_storage(&p))
+    .build(k)
+    .key("st-inside-measure");
+    let status = st.results.get(path).map_or_else(
+        || {
+            if st.errors.contains_key(path) || st.measuring_path() == Some(path) {
+                String::new()
+            } else {
+                "Not measured yet.".to_owned()
+            }
+        },
+        |m| {
+            format!(
+                "{} in {} files · measured {} ago",
+                fmt_size(m.du.total),
+                fmt_count(m.du.files),
+                fmt_ago(s.now - m.at)
+            )
+        },
+    );
     let head = row()
         .w_full()
         .gap(12.0)
