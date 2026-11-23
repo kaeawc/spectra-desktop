@@ -790,6 +790,9 @@ pub struct TimelinePage {
     pub threaded: bool,
     /// The Mac's offset from UTC at a time; sample scenes fix it so they render the same anywhere.
     pub local: fn(i64) -> Option<i64>,
+    /// A crash the Crashes page opened this page around, in Unix seconds: rows near it are
+    /// marked. Leaving the page forgets it.
+    pub anchor: Option<i64>,
     flight: Option<Flight>,
     job: u64,
     tx: Sender<Landed>,
@@ -813,6 +816,7 @@ impl TimelinePage {
             spectra: Arc::new(crate::inspect::System),
             threaded: true,
             local: local_offset,
+            anchor: None,
             flight: None,
             job: 0,
             tx,
@@ -925,6 +929,7 @@ impl App {
     pub fn timeline_nav(&mut self, from: Nav, to: Nav) {
         if from == Nav::Timeline && to != Nav::Timeline {
             self.timeline.cancel();
+            self.timeline.anchor = None;
         }
         if to == Nav::Timeline {
             self.read_timeline();

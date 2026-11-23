@@ -490,6 +490,12 @@ pub struct CrashesPage {
     pub picked: Option<(Section, String)>,
     /// Decoded reports by file, each the answer to an "Open report" press.
     pub opened: HashMap<String, Result<Inspected, String>>,
+    /// The window the strip keeps the lists to, from and to in Unix seconds.
+    pub range: Option<(i64, i64)>,
+    /// The strip's bars a drag has covered so far: where it started and where it is.
+    pub drag: Option<(usize, usize)>,
+    /// The strip's bar under the pointer.
+    pub hover: Option<usize>,
     pub spectra: Arc<dyn Spectra>,
     /// False in tests: a job runs on the calling thread.
     pub threaded: bool,
@@ -515,6 +521,9 @@ impl CrashesPage {
             error: None,
             picked: None,
             opened: HashMap::new(),
+            range: None,
+            drag: None,
+            hover: None,
             spectra: Arc::new(crate::inspect::System),
             threaded: true,
             reading: None,

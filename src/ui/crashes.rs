@@ -1,13 +1,18 @@
 //! The Crashes page: what has been crashing on this Mac, and why. Repeated crashes first (most
 //! often, then most recent), then the recent reports one by one, then processes ended for using
 //! too much memory. Picking a row and pressing "Open report" decodes that report and shows its
-//! crashed thread's top frames, the exception and the reason right under the row.
+//! crashed thread's top frames, the exception and the reason right under the row. A strip of
+//! crashes over time sits on top and can keep the lists to a window; a row whose process runs
+//! now says so and, picked, can open or sample it.
 
 use rune::{Cursor, El, col, el, row, text};
-use rune_kit::{Button, ButtonVariant, Kit, Spinner};
+use rune_kit::{Button, ButtonVariant, ControlSize, Kit, Spinner};
 
 use super::tools::failed;
 use crate::app::App;
+use crate::crash_live::{live_line, window_for};
+use crate::crash_source::frame_source;
+use crate::crash_strip::filtered;
 use crate::crashes::{
     DEADLINE, Inspected, MemoryKill, Report, STALE, Section, Signature, TOP_FRAMES, what,
 };
@@ -87,7 +92,9 @@ pub fn page(s: &App, k: &Kit) -> El {
             .key("cr-none"),
         );
     }
-    page.child(signatures(s, &data.signatures, wall, k))
+    let data = &filtered(data, c.range);
+    page.child(super::crash_strip::strip(s, k))
+        .child(signatures(s, &data.signatures, wall, k))
         .child(reports(
             s,
             &data.reports,
@@ -151,6 +158,7 @@ fn signatures(s: &App, sigs: &[Signature], wall: i64, k: &Kit) -> El {
             i,
             &x.file,
             &x.process,
+            x.last,
             &summary,
             &detail,
             k,
@@ -188,6 +196,7 @@ fn reports(s: &App, reports: &[Report], error: Option<&str>, wall: i64, k: &Kit)
             i,
             &r.file,
             &r.process,
+            r.at,
             &summary,
             &r.exception,
             k,
@@ -235,6 +244,7 @@ fn kills(s: &App, kills: &[MemoryKill], error: Option<&str>, wall: i64, k: &Kit)
             i,
             &m.file,
             &m.process,
+            m.at,
             &summary,
             &detail,
             k,
@@ -252,6 +262,7 @@ fn item(
     i: usize,
     file: &str,
     process: &str,
+    last: Option<i64>,
     summary: &str,
     detail: &str,
     k: &Kit,
@@ -293,6 +304,16 @@ fn item(
                 .truncate(),
         );
     }
+    let live = s.running_named(process);
+    if let Some(l) = &live {
+        words = words.child(
+            text(live_line(l, last, (s.wall)()))
+                .key(format!("{key}-live"))
+                .font(k.ty.small)
+                .color(c.success.fg)
+                .truncate(),
+        );
+    }
     let mut line = row()
         .w_full()
         .gap(12.0)
@@ -300,6 +321,28 @@ fn item(
         .px(12.0)
         .py(6.0)
         .child(words);
+    if picked && let Some(l) = &live {
+        let pid = l.pid;
+        line = line
+            .child(
+                Button::new("Open process")
+                    .variant(ButtonVariant::Ghost)
+                    .help(format!("Open pid {pid}'s page"))
+                    .on_press(move |s: &mut App| s.open_crashed(pid))
+                    .build(k)
+                    .key(format!("{key}-live-open")),
+            )
+            .child(
+                Button::new("Sample now")
+                    .variant(ButtonVariant::Ghost)
+                    .help(format!(
+                        "Open pid {pid}'s page and sample where its CPU time goes"
+                    ))
+                    .on_press(move |s: &mut App| s.sample_crashed(pid))
+                    .build(k)
+                    .key(format!("{key}-live-sample")),
+            );
+    }
     if picked {
         let opening = s.crashes.opening() == Some(file);
         line = line.child(if file.is_empty() {
@@ -343,7 +386,7 @@ fn item(
                         .child(small("Reading the report…", k)),
                 );
             }
-            Some(Ok(r)) => out = out.child(opened(&key, r, (s.wall)(), k)),
+            Some(Ok(r)) => out = out.child(opened(s, &key, r, k)),
             Some(Err(why)) => {
                 out = out.child(el().px(12.0).pb(8.0).child(failed(
                     &format!("{key}-failed"),
@@ -357,8 +400,11 @@ fn item(
     out
 }
 
-/// A decoded report: what happened, how it ended, and the crashed thread's top frames.
-fn opened(key: &str, r: &Inspected, wall: i64, k: &Kit) -> El {
+/// A decoded report: what happened, how it ended, and the crashed thread's top frames. A frame
+/// in an open-source system library links to a search of its public source, and a crash in the
+/// last week links to the Timeline around it.
+fn opened(s: &App, key: &str, r: &Inspected, k: &Kit) -> El {
+    let wall = (s.wall)();
     let c = &k.c;
     let mut body = col()
         .key(format!("{key}-report"))
@@ -381,13 +427,26 @@ fn opened(key: &str, r: &Inspected, wall: i64, k: &Kit) -> El {
         head.push_str(&format!(", on {}", r.os_version));
     }
     head.push('.');
-    body = body.child(
+    let mut top = row().w_full().gap(12.0).center_y().child(
         text(head)
             .key(format!("{key}-report-head"))
             .font(k.ty.small_medium)
             .color(c.text_base)
-            .wrap(),
+            .wrap()
+            .grow(1.0)
+            .min_w(0.0),
     );
+    if let Some(at) = r.at.filter(|at| window_for(wall - at).is_some()) {
+        top = top.child(
+            Button::new("See what changed then")
+                .variant(ButtonVariant::Ghost)
+                .help("Open the Timeline around this crash")
+                .on_press(move |s: &mut App| s.timeline_at_crash(at))
+                .build(k)
+                .key(format!("{key}-report-timeline")),
+        );
+    }
+    body = body.child(top);
     let mut facts: Vec<(&str, String)> = Vec::new();
     if !r.exception.is_empty() {
         let mut e = r.exception.clone();
@@ -459,14 +518,34 @@ fn opened(key: &str, r: &Inspected, wall: i64, k: &Kit) -> El {
         .radius(k.radius.sm)
         .fill(c.bg_base);
     for (n, f) in t.frames.iter().take(TOP_FRAMES).enumerate() {
-        frames = frames.child(
+        let mut line = row().w_full().gap(8.0).center_y().child(
             text(format!("{n:>2}  {f}"))
+                .key(format!("{key}-frame-{n}"))
                 .font(k.ty.mono)
                 .color(c.text_base)
                 .selectable(true)
                 .selection_color(k.selection())
-                .truncate(),
+                .truncate()
+                .grow(1.0)
+                .min_w(0.0),
         );
+        if let Some((source, term, url)) = frame_source(f) {
+            line = line.child(
+                Button::new("View source")
+                    .variant(ButtonVariant::GhostMuted)
+                    .control_size(ControlSize::Small)
+                    .help(format!(
+                        "Search {}'s public source for {term} in your browser",
+                        source.name
+                    ))
+                    .on_press_tx(move |_: &mut App, tx| {
+                        let _ = tx.open_url(&url);
+                    })
+                    .build(k)
+                    .key(format!("{key}-frame-{n}-source")),
+            );
+        }
+        frames = frames.child(line);
     }
     if t.frames.is_empty() {
         frames = frames.child(small("No frames.", k));
