@@ -561,9 +561,14 @@ pub enum Go {
     App(String),
 }
 
-/// Readings further apart than this many times their interval leave a gap the load history
-/// can't see into: the window was hidden, or readings failed.
-pub const GAP: f64 = 3.0;
+/// How far apart two load readings may land, `every` seconds apart plus the round's own time,
+/// before the gap between them is one the history can't see into (the window was hidden, or
+/// readings failed); also how old the last may be to still say the load is high. The Machine
+/// page's own allowance for a reading going stale (`Section::stale`), so a round slowed by
+/// load, its three reads taking up to 20 s each, still counts.
+pub fn gap_allowance(every: f64) -> f64 {
+    3.0 * (every + 2.0)
+}
 
 /// A climb the load history saw.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -598,14 +603,14 @@ pub fn slow_since(
     // The calm reading before the climb and every high one since, with no gap between.
     if points[first - 1..]
         .windows(2)
-        .any(|w| w[1].0 - w[0].0 > every * GAP)
+        .any(|w| w[1].0 - w[0].0 > gap_allowance(every))
     {
         return None;
     }
     let last = points.last()?.0;
     Some(Slow {
         at: wall - (now - points[first].0).round() as i64,
-        fresh: now - last <= every * GAP,
+        fresh: now - last <= gap_allowance(every),
     })
 }
 
@@ -633,15 +638,38 @@ pub fn parse_tzif(b: &[u8]) -> Option<Zone> {
         Some(c)
     }
     // isutcnt, isstdcnt, leapcnt, timecnt, typecnt, charcnt.
+    // The bytes a block's counts say it holds, None when that overflows: a corrupt count can't
+    // ask for more than the file has.
+    fn block(c: &[usize; 6], n: usize) -> Option<usize> {
+        let parts = [
+            c[3].checked_mul(n + 1)?,
+            c[4].checked_mul(6)?,
+            c[5],
+            c[2].checked_mul(n + 4)?,
+            c[1],
+            c[0],
+        ];
+        parts.iter().try_fold(0usize, |a, p| a.checked_add(*p))
+    }
+    let fits = |at: usize, c: &[usize; 6], n: usize| {
+        block(c, n)
+            .and_then(|s| at.checked_add(s))
+            .is_some_and(|end| end <= b.len())
+    };
     let c = counts(b, 0)?;
+    if !fits(44, &c, 4) {
+        return None;
+    }
     let (mut at, mut n) = (44, 4);
     if *b.get(4)? >= b'2' {
-        let v1 = c[3] * 5 + c[4] * 6 + c[5] + c[2] * 8 + c[1] + c[0];
-        at = 44 + v1;
+        at = 44 + block(&c, 4)?;
         n = 8;
     }
     let c = if n == 8 { counts(b, at)? } else { c };
     let at = if n == 8 { at + 44 } else { at };
+    if !fits(at, &c, n) {
+        return None;
+    }
     let (times, types) = (c[3], c[4]);
     if types == 0 {
         return None;
@@ -667,23 +695,32 @@ pub fn zone_offset(zone: &[(i64, i64)], at: i64) -> Option<i64> {
     zone.iter().rev().find(|(from, _)| *from <= at).map(|z| z.1)
 }
 
+/// The zone `tz` (the `TZ` variable) names, else the Mac's own: `TZ`'s file first when it names
+/// one, then `/etc/localtime`, so a `TZ` holding a rule (`CET-1CEST,M3.5.0,M10.5.0/3`) or a
+/// zone that isn't there still gets the Mac's clock.
+pub fn read_zone(tz: Option<&str>, read: impl Fn(&str) -> Option<Vec<u8>>) -> Option<Zone> {
+    let mut paths = Vec::new();
+    if let Some(tz) = tz.map(|t| t.trim_start_matches(':'))
+        && !tz.is_empty()
+        && !tz.contains("..")
+    {
+        paths.push(if tz.starts_with('/') {
+            tz.to_owned()
+        } else {
+            format!("/usr/share/zoneinfo/{tz}")
+        });
+    }
+    paths.push("/etc/localtime".to_owned());
+    paths.iter().find_map(|p| parse_tzif(&read(p)?))
+}
+
 /// The Mac's own offset from UTC at `at`, in seconds east, from its time zone file (`TZ` when
 /// it names a zone, else `/etc/localtime`), read once. None when it can't be read.
 pub fn local_offset(at: i64) -> Option<i64> {
     static ZONE: std::sync::OnceLock<Option<Zone>> = std::sync::OnceLock::new();
     let zone = ZONE.get_or_init(|| {
-        let path = match std::env::var("TZ") {
-            Ok(tz) if !tz.trim_start_matches(':').is_empty() && !tz.contains("..") => {
-                let tz = tz.trim_start_matches(':');
-                if tz.starts_with('/') {
-                    tz.to_owned()
-                } else {
-                    format!("/usr/share/zoneinfo/{tz}")
-                }
-            }
-            _ => "/etc/localtime".to_owned(),
-        };
-        parse_tzif(&std::fs::read(path).ok()?)
+        let tz = std::env::var("TZ").ok();
+        read_zone(tz.as_deref(), |p| std::fs::read(p).ok())
     });
     zone_offset(zone.as_ref()?, at)
 }
@@ -1207,6 +1244,22 @@ pub(crate) mod tests {
         assert_eq!(slow_since(&hidden, 8, 5.0, 3606.0, NOW), None);
         let gap_since = pts(&[(0.0, 2.0), (5.0, 9.0), (3600.0, 9.0)]);
         assert_eq!(slow_since(&gap_since, 8, 5.0, 3600.0, NOW), None);
+        // Rounds slowed by the load itself land 8 to 12 s apart: still no gap, still fresh.
+        let slowed = pts(&[
+            (0.0, 2.0),
+            (9.0, 3.0),
+            (17.0, 9.0),
+            (29.0, 12.0),
+            (39.0, 11.0),
+        ]);
+        let slow = slow_since(&slowed, 8, 5.0, 50.0, NOW).unwrap();
+        assert_eq!(
+            slow,
+            Slow {
+                at: NOW - 33,
+                fresh: true
+            }
+        );
         // A climb seen without gaps, but the last reading is ten minutes old: not "still" high.
         let stale = slow_since(&loads, 8, 5.0, 700.0, NOW).unwrap();
         assert_eq!(
@@ -1295,6 +1348,29 @@ pub(crate) mod tests {
         assert_eq!(zone_offset(&zone, NOW), Some(-5 * 3600));
         assert_eq!(zone_offset(&zone, 0), Some(-5 * 3600));
         assert!(parse_tzif(b"not a zone").is_none());
+        // A corrupt count asking for billions of types or transitions is refused at once.
+        let mut bad = tzif();
+        let second = 44 + 10;
+        bad[second + 36..second + 40].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(parse_tzif(&bad).is_none());
+        let mut bad = tzif();
+        bad[32..36].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(parse_tzif(&bad).is_none());
+        // A TZ that names a zone reads it; one holding a rule, or naming a missing zone, falls
+        // back to /etc/localtime rather than UTC.
+        let file = tzif();
+        let only = |want: &'static str| {
+            let file = file.clone();
+            move |p: &str| (p == want).then(|| file.clone())
+        };
+        let ny = "/usr/share/zoneinfo/America/New_York";
+        assert!(read_zone(Some(":America/New_York"), only(ny)).is_some());
+        let rule = Some("CET-1CEST,M3.5.0,M10.5.0/3");
+        let zone = read_zone(rule, only("/etc/localtime")).unwrap();
+        assert_eq!(zone_offset(&zone, NOW), Some(-5 * 3600));
+        assert!(read_zone(Some("Nowhere/Missing"), only("/etc/localtime")).is_some());
+        assert!(read_zone(None, only("/etc/localtime")).is_some());
+        assert!(read_zone(rule, |_| None).is_none());
         // A reading with only UTC times still shows the Mac's clock.
         let events = parse_timeline(
             r#"{"events": [{"time": "2026-11-20T11:52:00Z", "source": "update", "summary": "installed Slack 4.41.105"}]}"#,
