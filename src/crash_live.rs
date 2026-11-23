@@ -4,6 +4,7 @@
 //! own Sample tool, or opens the Timeline around a crash.
 
 use crate::app::App;
+use crate::crashes::Section;
 use crate::groups::Nav;
 use crate::procs::{Process, fmt_cpu, fmt_mem, parse_rfc3339};
 use crate::timeline::{SLOW_AFTER, Window};
@@ -95,15 +96,54 @@ impl App {
     }
 
     /// Opens a running crashed process's page, so "back" returns to the Crashes page.
-    pub fn open_crashed(&mut self, pid: u32) {
-        self.open(pid);
+    pub fn open_crashed(
+        &mut self,
+        section: Section,
+        file: &str,
+        pid: u32,
+        name: &str,
+        started: Option<i64>,
+    ) {
+        if self.still_running(section, file, pid, name, started) {
+            self.open(pid);
+        }
+    }
+
+    /// Whether `pid` is still in the process list under `name` (and the start time it had when
+    /// the row was drawn, when both are known); if not, the row says it has exited.
+    fn still_running(
+        &mut self,
+        section: Section,
+        file: &str,
+        pid: u32,
+        name: &str,
+        started: Option<i64>,
+    ) -> bool {
+        let same = self.process(pid).is_some_and(|p| {
+            p.name() == name
+                && match (started, parse_rfc3339(&p.started_at)) {
+                    (Some(was), Some(now)) => was == now,
+                    _ => true,
+                }
+        });
+        self.crashes.gone = (!same).then(|| (section, file.to_owned()));
+        same
     }
 
     /// Opens a running crashed process's page and starts its Sample tool there; the page says
     /// why if it can't run.
-    pub fn sample_crashed(&mut self, pid: u32) {
-        self.open(pid);
-        self.run_tool(Tool::Sample);
+    pub fn sample_crashed(
+        &mut self,
+        section: Section,
+        file: &str,
+        pid: u32,
+        name: &str,
+        started: Option<i64>,
+    ) {
+        if self.still_running(section, file, pid, name, started) {
+            self.open(pid);
+            self.run_tool(Tool::Sample);
+        }
     }
 
     /// Opens the Timeline over the shortest window that holds a crash at `at`, with the rows
@@ -112,6 +152,9 @@ impl App {
         let Some(w) = window_for((self.wall)() - at) else {
             return;
         };
+        if self.timeline.anchor.is_none() {
+            self.timeline.prior_window = Some(self.timeline.window);
+        }
         self.timeline.window = w;
         self.timeline.anchor = Some(at);
         self.select(None);

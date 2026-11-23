@@ -490,6 +490,8 @@ pub struct CrashesPage {
     pub picked: Option<(Section, String)>,
     /// Decoded reports by file, each the answer to an "Open report" press.
     pub opened: HashMap<String, Result<Inspected, String>>,
+    /// The row whose Open process / Sample now found the process had exited.
+    pub gone: Option<(Section, String)>,
     /// The window the strip keeps the lists to, from and to in Unix seconds.
     pub range: Option<(i64, i64)>,
     /// The strip's bars a drag has covered so far: where it started and where it is.
@@ -521,6 +523,7 @@ impl CrashesPage {
             error: None,
             picked: None,
             opened: HashMap::new(),
+            gone: None,
             range: None,
             drag: None,
             hover: None,
@@ -647,7 +650,11 @@ impl App {
 
     /// Picks a row; picking it again leaves it picked.
     pub fn pick_crash(&mut self, section: Section, file: &str) {
-        self.crashes.picked = Some((section, file.to_owned()));
+        let row = (section, file.to_owned());
+        if self.crashes.gone.as_ref() != Some(&row) {
+            self.crashes.gone = None;
+        }
+        self.crashes.picked = Some(row);
     }
 
     /// Decodes the picked row's report, stopping any other decoding on its way.
@@ -730,6 +737,8 @@ impl App {
     pub fn crashes_nav(&mut self, from: Nav, to: Nav) {
         if from == Nav::Crashes && to != Nav::Crashes {
             self.crashes.cancel();
+            self.crashes.range = None;
+            self.crashes.drag = None;
         }
         if to == Nav::Crashes && from != Nav::Crashes && self.crashes.wants_read((self.wall)()) {
             self.read_crashes();

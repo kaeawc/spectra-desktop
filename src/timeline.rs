@@ -793,6 +793,8 @@ pub struct TimelinePage {
     /// A crash the Crashes page opened this page around, in Unix seconds: rows near it are
     /// marked. Leaving the page forgets it.
     pub anchor: Option<i64>,
+    /// The window the page was on before an anchor widened it, put back when the anchor goes.
+    pub prior_window: Option<Window>,
     flight: Option<Flight>,
     job: u64,
     tx: Sender<Landed>,
@@ -817,6 +819,7 @@ impl TimelinePage {
             threaded: true,
             local: local_offset,
             anchor: None,
+            prior_window: None,
             flight: None,
             job: 0,
             tx,
@@ -892,6 +895,8 @@ impl App {
 
     /// A different window reads again at once.
     pub fn set_timeline_window(&mut self, w: Window) {
+        // A window the person picks is theirs to keep.
+        self.timeline.prior_window = None;
         if self.timeline.window != w {
             self.timeline.window = w;
             self.read_timeline();
@@ -930,6 +935,9 @@ impl App {
         if from == Nav::Timeline && to != Nav::Timeline {
             self.timeline.cancel();
             self.timeline.anchor = None;
+            if let Some(w) = self.timeline.prior_window.take() {
+                self.timeline.window = w;
+            }
         }
         if to == Nav::Timeline {
             self.read_timeline();

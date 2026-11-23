@@ -88,34 +88,40 @@ impl Strip {
         self.counts[lo..=hi].iter().sum()
     }
 
+    /// Where the last bar ends.
+    pub fn end(&self) -> i64 {
+        self.start + BUCKETS as i64 * self.step
+    }
+
     pub fn max(&self) -> u32 {
         self.counts.iter().copied().max().unwrap_or(0)
     }
 }
 
 /// Whether a time is inside `window` (from inclusive, to exclusive); everything is without one,
-/// and a row without a time is outside any.
-pub fn within(at: Option<i64>, window: Option<(i64, i64)>) -> bool {
+/// and a row without a time is outside any. A window that reaches the strip's `end` keeps every
+/// later time too, as the last bar counts them.
+pub fn within(at: Option<i64>, window: Option<(i64, i64)>, end: i64) -> bool {
     match (window, at) {
         (None, _) => true,
-        (Some((from, to)), Some(t)) => t >= from && t < to,
+        (Some((from, to)), Some(t)) => t >= from && (t < to || to >= end),
         (Some(_), None) => false,
     }
 }
 
 /// Whether a signature's crashes, first to last, could include one inside `window`.
-pub fn overlaps(s: &Signature, window: Option<(i64, i64)>) -> bool {
+pub fn overlaps(s: &Signature, window: Option<(i64, i64)>, end: i64) -> bool {
     let Some((from, to)) = window else {
         return true;
     };
     match (s.first.or(s.last), s.last.or(s.first)) {
-        (Some(first), Some(last)) => first < to && last >= from,
+        (Some(first), Some(last)) => (first < to || to >= end) && last >= from,
         _ => false,
     }
 }
 
 /// The lists, kept to `window`.
-pub fn filtered(c: &Crashes, window: Option<(i64, i64)>) -> Crashes {
+pub fn filtered(c: &Crashes, window: Option<(i64, i64)>, end: i64) -> Crashes {
     if window.is_none() {
         return c.clone();
     }
@@ -123,19 +129,19 @@ pub fn filtered(c: &Crashes, window: Option<(i64, i64)>) -> Crashes {
         signatures: c
             .signatures
             .iter()
-            .filter(|s| overlaps(s, window))
+            .filter(|s| overlaps(s, window, end))
             .cloned()
             .collect::<Vec<Signature>>(),
         reports: c
             .reports
             .iter()
-            .filter(|r| within(r.at, window))
+            .filter(|r| within(r.at, window, end))
             .cloned()
             .collect::<Vec<Report>>(),
         kills: c
             .kills
             .iter()
-            .filter(|k| within(k.at, window))
+            .filter(|k| within(k.at, window, end))
             .cloned()
             .collect::<Vec<MemoryKill>>(),
         reports_error: c.reports_error.clone(),
@@ -272,7 +278,7 @@ mod tests {
         let c = fixture();
         // 05:00 to 06:30 New York on Nov 20.
         let w = Some((t("2026-11-20T10:00:00Z"), t("2026-11-20T11:30:00Z")));
-        let f = filtered(&c, w);
+        let f = filtered(&c, w, i64::MAX);
         let names = |v: Vec<&str>| v.join(",");
         assert_eq!(
             names(f.reports.iter().map(|r| r.process.as_str()).collect()),
@@ -284,10 +290,30 @@ mod tests {
             names(f.signatures.iter().map(|s| s.process.as_str()).collect()),
             "syncbridged,WidgetHostService,thumbnailagent"
         );
-        assert_eq!(filtered(&c, None), c);
-        assert!(within(Some(5), Some((5, 6))));
-        assert!(!within(Some(6), Some((5, 6))), "the end is outside");
-        assert!(!within(None, Some((5, 6))));
-        assert!(within(None, None));
+        assert_eq!(filtered(&c, None, i64::MAX), c);
+        assert!(within(Some(5), Some((5, 6)), 100));
+        assert!(!within(Some(6), Some((5, 6)), 100), "the end is outside");
+        assert!(!within(None, Some((5, 6)), 100));
+        assert!(within(None, None, 100));
+    }
+
+    #[test]
+    fn a_report_after_the_clock_is_in_the_last_bar_and_in_its_window() {
+        let late = WALL + 90;
+        let s = Strip::of(&[late], WALL);
+        assert_eq!(s.counts[BUCKETS - 1], 1);
+        let w = Some(s.window(BUCKETS - 1, BUCKETS - 1));
+        assert!(within(Some(late), w, s.end()));
+        assert!(
+            within(Some(s.end()), w, s.end()),
+            "the last end is inclusive"
+        );
+        assert!(
+            within(Some(s.end() + 5_000), w, s.end()),
+            "far future clamps in"
+        );
+        // Earlier windows still end before their last second.
+        let early = s.window(0, 0);
+        assert!(!within(Some(early.1), Some(early), s.end()));
     }
 }

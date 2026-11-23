@@ -92,7 +92,11 @@ pub fn page(s: &App, k: &Kit) -> El {
             .key("cr-none"),
         );
     }
-    let data = &filtered(data, c.range);
+    let data = &filtered(
+        data,
+        c.range,
+        s.crash_strip().map_or(i64::MAX, |st| st.end()),
+    );
     page.child(super::crash_strip::strip(s, k))
         .child(signatures(s, &data.signatures, wall, k))
         .child(reports(
@@ -134,7 +138,12 @@ fn signatures(s: &App, sigs: &[Signature], wall: i64, k: &Kit) -> El {
         k,
     ));
     if sigs.is_empty() {
-        return body.child(small("No crashes to group.", k).key("cr-sigs-none"));
+        let none = if s.crashes.range.is_some() {
+            "None in the chosen hours."
+        } else {
+            "No crashes to group."
+        };
+        return body.child(small(none, k).key("cr-sigs-none"));
     }
     let mut list = frame(k);
     for (i, x) in sigs.iter().enumerate() {
@@ -182,7 +191,12 @@ fn reports(s: &App, reports: &[Report], error: Option<&str>, wall: i64, k: &Kit)
         ));
     }
     if reports.is_empty() {
-        return body.child(small("No crash or hang reports.", k).key("cr-reps-none"));
+        let none = if s.crashes.range.is_some() {
+            "None in the chosen hours."
+        } else {
+            "No crash or hang reports."
+        };
+        return body.child(small(none, k).key("cr-reps-none"));
     }
     let mut list = frame(k);
     for (i, r) in reports.iter().enumerate() {
@@ -220,7 +234,12 @@ fn kills(s: &App, kills: &[MemoryKill], error: Option<&str>, wall: i64, k: &Kit)
         ));
     }
     if kills.is_empty() {
-        return body.child(small("None.", k).key("cr-ooms-none"));
+        let none = if s.crashes.range.is_some() {
+            "None in the chosen hours."
+        } else {
+            "None."
+        };
+        return body.child(small(none, k).key("cr-ooms-none"));
     }
     let mut list = frame(k);
     for (i, m) in kills.iter().enumerate() {
@@ -322,13 +341,15 @@ fn item(
         .py(6.0)
         .child(words);
     if picked && let Some(l) = &live {
-        let pid = l.pid;
+        let (pid, name, started) = (l.pid, process.to_owned(), l.started);
+        let (n2, f2) = (name.clone(), file.to_owned());
+        let file2 = f2.clone();
         line = line
             .child(
                 Button::new("Open process")
                     .variant(ButtonVariant::Ghost)
                     .help(format!("Open pid {pid}'s page"))
-                    .on_press(move |s: &mut App| s.open_crashed(pid))
+                    .on_press(move |s: &mut App| s.open_crashed(section, &f2, pid, &n2, started))
                     .build(k)
                     .key(format!("{key}-live-open")),
             )
@@ -338,10 +359,15 @@ fn item(
                     .help(format!(
                         "Open pid {pid}'s page and sample where its CPU time goes"
                     ))
-                    .on_press(move |s: &mut App| s.sample_crashed(pid))
+                    .on_press(move |s: &mut App| {
+                        s.sample_crashed(section, &file2, pid, &name, started)
+                    })
                     .build(k)
                     .key(format!("{key}-live-sample")),
             );
+    }
+    if picked && s.crashes.gone.as_ref() == Some(&(section, file.to_owned())) {
+        line = line.child(small("It has exited since.", k).key(format!("{key}-gone")));
     }
     if picked {
         let opening = s.crashes.opening() == Some(file);

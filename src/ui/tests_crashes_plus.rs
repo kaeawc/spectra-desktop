@@ -269,3 +269,88 @@ fn see_what_changed_then_opens_the_timeline_around_the_crash() {
     settle(&mut rt);
     assert_eq!(rt.state.timeline.anchor, None);
 }
+
+#[test]
+fn the_timeline_window_comes_back_after_an_anchored_visit() {
+    let mut rt = scene(crashes_report_links_scene);
+    rt.update(|s, _| {
+        s.timeline.window = Window::Hour;
+        let old = (s.wall)() - 3 * 86_400;
+        s.timeline_at_crash(old);
+    });
+    settle(&mut rt);
+    assert_eq!(rt.state.nav, Nav::Timeline);
+    assert_eq!(rt.state.timeline.window, Window::Week);
+    rt.update(|s, _| s.show(Nav::Crashes));
+    settle(&mut rt);
+    assert_eq!(rt.state.timeline.anchor, None);
+    rt.update(|s, _| s.show(Nav::Timeline));
+    settle(&mut rt);
+    assert_eq!(rt.state.timeline.window, Window::Hour);
+}
+
+#[test]
+fn a_window_with_nothing_in_it_says_so_and_leaving_forgets_it() {
+    let mut rt = scene(crashes_scene);
+    rt.update(|s, _| {
+        s.crashes.range = Some((0, 1));
+        s.crashes.drag = Some((1, 2));
+    });
+    settle(&mut rt);
+    for key in ["cr-sigs-none", "cr-reps-none", "cr-ooms-none"] {
+        assert_eq!(text_of(&mut rt, key), "None in the chosen hours.", "{key}");
+    }
+    rt.update(|s, _| s.show(Nav::Timeline));
+    settle(&mut rt);
+    assert_eq!(rt.state.crashes.range, None);
+    assert_eq!(rt.state.crashes.drag, None);
+}
+
+#[test]
+fn a_pid_that_has_exited_since_is_not_opened_or_sampled() {
+    let mut rt = scene(crashes_live_scene);
+    let live = rt.state.running_named("syncbridged").unwrap();
+    let file = rt.state.crashes.picked.clone().unwrap().1;
+    let sec = rt.state.crashes.picked.clone().unwrap().0;
+    let without: Vec<_> = rt
+        .state
+        .procs
+        .iter()
+        .filter(|p| p.pid != 6120)
+        .cloned()
+        .collect();
+    let with_all = rt.state.procs.clone();
+    rt.update(move |s, _| s.land_procs(Ok(without)));
+    rt.update(move |s, _| {
+        s.open_crashed(sec, &file, 6120, "syncbridged", live.started);
+        s.sample_crashed(sec, &file, 6120, "syncbridged", live.started);
+    });
+    settle(&mut rt);
+    assert_eq!(rt.state.selected, None);
+    assert!(has(&mut rt, &format!("{SYNC}-gone")));
+    assert_eq!(
+        text_of(&mut rt, &format!("{SYNC}-gone")),
+        "It has exited since."
+    );
+    // The pid reused by another process, or by the same name started later, is not it either.
+    let live = {
+        rt.update(move |s, _| s.land_procs(Ok(with_all)));
+        rt.state.running_named("syncbridged").unwrap()
+    };
+    let (sec, file) = rt.state.crashes.picked.clone().unwrap();
+    let mut reused = rt.state.procs.clone();
+    for p in reused.iter_mut().filter(|p| p.pid == 6120) {
+        p.started_at = "2026-11-20T07:30:00-05:00".into();
+    }
+    rt.update(move |s, _| s.land_procs(Ok(reused)));
+    let f = file.clone();
+    rt.update(move |s, _| s.open_crashed(sec, &f, 6120, "syncbridged", live.started));
+    assert_eq!(rt.state.selected, None);
+    let mut renamed = rt.state.procs.clone();
+    for p in renamed.iter_mut().filter(|p| p.pid == 6120) {
+        p.command = "otherd".into();
+    }
+    rt.update(move |s, _| s.land_procs(Ok(renamed)));
+    rt.update(move |s, _| s.open_crashed(sec, &file, 6120, "syncbridged", None));
+    assert_eq!(rt.state.selected, None);
+}
