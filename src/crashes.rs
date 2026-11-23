@@ -147,11 +147,14 @@ pub fn parse_time(s: &str) -> Option<i64> {
     parse_rfc3339(&format!("{when}{}:{}", &zone[..3], &zone[3..]))
 }
 
-/// The exception in plain words, where it's obvious: the signal first, then the exception type.
+/// The exception in plain words, where it's obvious: a resource limit first (it ends in SIGKILL),
+/// then the signal, then the exception type.
 pub fn plain(exception: &str) -> Option<&'static str> {
     let e = exception.to_ascii_uppercase();
     let has = |w: &str| e.contains(w);
-    Some(if has("SIGKILL") {
+    Some(if has("EXC_RESOURCE") {
+        "went over a limit"
+    } else if has("SIGKILL") {
         "killed"
     } else if has("SIGABRT") {
         "aborted itself"
@@ -163,8 +166,6 @@ pub fn plain(exception: &str) -> Option<&'static str> {
         "ran a bad instruction"
     } else if has("SIGFPE") || has("EXC_ARITHMETIC") {
         "bad arithmetic"
-    } else if has("EXC_RESOURCE") {
-        "went over a limit"
     } else if has("EXC_GUARD") {
         "broke a guarded resource"
     } else {
@@ -482,7 +483,7 @@ struct Flight {
 
 /// The Crashes page's state.
 pub struct CrashesPage {
-    /// The last good reading and the wall clock when it was asked for.
+    /// The last good reading and the wall clock when it landed.
     pub data: Option<(Crashes, i64)>,
     pub error: Option<String>,
     /// The picked row: its list and its report file.
@@ -909,7 +910,7 @@ pub(crate) mod tests {
     #[test]
     fn exceptions_read_in_plain_words() {
         assert_eq!(plain("EXC_CRASH (SIGKILL)"), Some("killed"));
-        assert_eq!(plain("EXC_RESOURCE (SIGKILL)"), Some("killed"));
+        assert_eq!(plain("EXC_RESOURCE (SIGKILL)"), Some("went over a limit"));
         assert_eq!(plain("EXC_BAD_ACCESS (SIGSEGV)"), Some("bad memory access"));
         assert_eq!(plain("EXC_BAD_ACCESS (SIGBUS)"), Some("bad memory access"));
         assert_eq!(
