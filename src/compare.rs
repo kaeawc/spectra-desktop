@@ -556,6 +556,9 @@ pub enum Landed {
     },
     Diffed {
         job: u64,
+        /// What the diff ran with, which the page's choice may no longer be.
+        from: String,
+        to: Option<String>,
         result: Result<Diff, String>,
     },
     Taken {
@@ -797,6 +800,8 @@ impl App {
         let runner = Arc::clone(&c.runner);
         let failed = Landed::Diffed {
             job,
+            from: from.clone(),
+            to: to.clone(),
             result: Err(format!(
                 "Couldn't ask Spectra to compare them: {THREAD_FAILED}."
             )),
@@ -806,6 +811,8 @@ impl App {
             self.wake.clone(),
             move || Landed::Diffed {
                 job,
+                from: from.clone(),
+                to: to.clone(),
                 result: run_diff(runner.as_ref(), &from, to.as_deref(), &cancel),
             },
             failed,
@@ -932,7 +939,12 @@ impl App {
                         Err(why) => c.list_error = Some(why),
                     }
                 }
-                Landed::Diffed { job, result } => {
+                Landed::Diffed {
+                    job,
+                    from,
+                    to,
+                    result,
+                } => {
                     if c.diffing.as_ref().is_none_or(|d| d.job != job) {
                         continue;
                     }
@@ -941,8 +953,8 @@ impl App {
                         Ok(diff) => {
                             c.diff_error = None;
                             c.shown = Some(Shown {
-                                from: c.from.clone().unwrap_or_default(),
-                                to: c.to.clone(),
+                                from,
+                                to,
                                 diff,
                                 at: now,
                             });
@@ -961,8 +973,8 @@ impl App {
                 }
             }
         }
-        // The new snapshot is in the list now.
-        if reread {
+        // The new snapshot is in the list now. Off the page nothing is read: opening it reads.
+        if reread && self.nav == crate::groups::Nav::Compare {
             self.open_compare();
         }
         landed
@@ -1034,6 +1046,7 @@ pub(crate) mod tests {
         s.compare.runner = fake.clone();
         s.compare.threaded = false;
         s.visible = true;
+        s.nav = crate::groups::Nav::Compare;
         s
     }
 
@@ -1398,6 +1411,58 @@ pub(crate) mod tests {
         s.cancel_compare();
         assert!(s.compare.diffing.is_none());
         assert!(s.compare.taking.is_some(), "a snapshot is left to finish");
+    }
+
+    #[test]
+    fn the_result_names_what_the_diff_ran_with_not_the_choice_now() {
+        let fake = Arc::new(Fake::new());
+        let mut s = app(&fake);
+        s.open_compare();
+        s.land_compare();
+        let (a, b) = {
+            let l = s.compare.list.as_ref().unwrap();
+            (l[6].id.clone(), l[2].id.clone())
+        };
+        s.pick_from(&a);
+        s.run_compare();
+        s.pick_from(&b);
+        s.land_compare();
+        let shown = s.compare.shown.clone().unwrap();
+        assert_eq!(
+            (shown.from.as_str(), shown.to.as_deref()),
+            (a.as_str(), None)
+        );
+        // The chosen one dropped by a list reread mid-diff: still the original.
+        s.pick_from(&a);
+        let diffing = Arc::clone(&s.compare.runner);
+        s.compare.runner = Arc::new(Fake {
+            list: ok("[]"),
+            ..Fake::new()
+        });
+        s.open_compare();
+        s.compare.runner = diffing;
+        s.run_compare();
+        s.land_compare();
+        assert_eq!(s.compare.from, None, "the list no longer has it");
+        let shown = s.compare.shown.clone().unwrap();
+        assert_eq!(shown.from, a);
+    }
+
+    #[test]
+    fn a_snapshot_landing_off_the_page_reads_nothing() {
+        let fake = Arc::new(Fake::new());
+        let mut s = app(&fake);
+        s.nav = crate::groups::Nav::All;
+        s.take_snapshot(false);
+        s.land_compare();
+        assert!(s.compare.taken.as_ref().unwrap().is_ok());
+        assert_eq!(fake.count("list"), 0);
+        assert!(!s.compare.reading);
+        s.tick_compare();
+        assert_eq!(fake.count("list"), 0);
+        s.show(crate::groups::Nav::Compare);
+        s.land_compare();
+        assert_eq!(fake.count("list"), 1, "opening the page reads it");
     }
 
     #[test]
