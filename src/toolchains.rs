@@ -109,7 +109,7 @@ impl Inventory {
         }
         if self.java_home_exists == Some(false) {
             out.push(format!(
-                "JAVA_HOME points to {}, which isn't there. Java tools that follow it will fail to start.",
+                "JAVA_HOME points to {}, which isn't there. Java tools that follow it will fail to start. (The JAVA_HOME this app was started with.)",
                 self.java_home
             ));
         }
@@ -413,6 +413,8 @@ pub struct ToolchainsPage {
     reading: bool,
     /// The page opened while the window was hidden: it reads once the window is shown.
     wanted: bool,
+    /// A read was cut off by leaving the page: the next open reads again.
+    cut: bool,
     job: u64,
     cancel: Arc<AtomicBool>,
     tx: Sender<Landed>,
@@ -438,6 +440,7 @@ impl ToolchainsPage {
             toggled: HashSet::new(),
             reading: false,
             wanted: false,
+            cut: false,
             job: 0,
             cancel: Arc::new(AtomicBool::new(false)),
             tx,
@@ -474,7 +477,7 @@ impl App {
     /// a page that already has its reading (or its failure; Refresh tries again).
     pub fn open_toolchains(&mut self) {
         let t = &self.toolchains;
-        if t.reading || (t.data.is_some() || t.error.is_some()) {
+        if t.reading || ((t.data.is_some() || t.error.is_some()) && !t.cut) {
             return;
         }
         self.refresh_toolchains();
@@ -493,6 +496,7 @@ impl App {
             return;
         }
         t.wanted = false;
+        t.cut = false;
         t.reading = true;
         t.job += 1;
         t.cancel = Arc::new(AtomicBool::new(false));
@@ -538,8 +542,12 @@ impl App {
         }
     }
 
-    /// Opens a closed section and closes an open one.
+    /// Opens a closed section and closes an open one. While searching every matching section is
+    /// open, so a press there changes nothing.
     pub fn toggle_toolchain_section(&mut self, id: &str) {
+        if !self.toolchains.search().is_empty() {
+            return;
+        }
         let t = &mut self.toolchains.toggled;
         if !t.remove(id) {
             t.insert(id.to_owned());
@@ -551,6 +559,7 @@ impl App {
     pub fn cancel_toolchains(&mut self) {
         let t = &mut self.toolchains;
         t.cancel.store(true, Ordering::SeqCst);
+        t.cut |= t.reading || t.wanted;
         t.reading = false;
         t.wanted = false;
     }
@@ -831,6 +840,35 @@ pub(crate) mod tests {
             s.tick_toolchains();
         }
         assert_eq!(fake.count(), 2);
+    }
+
+    #[test]
+    fn a_refresh_cut_off_by_leaving_reads_again_on_return() {
+        let fake = Arc::new(Fake::new(ok(FULL)));
+        let mut s = app(&fake);
+        s.show(crate::groups::Nav::Toolchains);
+        s.land_toolchains();
+        s.refresh_toolchains();
+        assert_eq!(fake.count(), 2);
+        s.show(crate::groups::Nav::All);
+        s.show(crate::groups::Nav::Toolchains);
+        assert_eq!(fake.count(), 3, "the cut-off refresh is read again");
+        s.land_toolchains();
+        s.show(crate::groups::Nav::All);
+        s.show(crate::groups::Nav::Toolchains);
+        assert_eq!(fake.count(), 3, "a finished one isn't");
+    }
+
+    #[test]
+    fn a_header_press_while_searching_changes_nothing() {
+        let fake = Arc::new(Fake::new(ok(FULL)));
+        let mut s = app(&fake);
+        s.toolchains.query = TextEdit::new("jq");
+        s.toggle_toolchain_section("brew_formulae");
+        assert!(s.toolchains.toggled.is_empty());
+        s.toolchains.query = TextEdit::new("");
+        s.toggle_toolchain_section("brew_formulae");
+        assert!(s.toolchains.toggled.contains("brew_formulae"));
     }
 
     #[test]
