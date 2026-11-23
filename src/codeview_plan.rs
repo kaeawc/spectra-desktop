@@ -162,6 +162,8 @@ pub struct Step {
     pub args: Vec<String>,
     /// Files written into the temp folder first: name and contents.
     pub files: Vec<(String, String)>,
+    /// Folders made in the temp folder first.
+    pub dirs: Vec<String>,
     pub output: Output,
     pub parse: Parse,
     /// Run only when the source file is minified.
@@ -175,6 +177,7 @@ impl Step {
             program: program.to_path_buf(),
             args,
             files: Vec::new(),
+            dirs: Vec::new(),
             output: Output::Stdout,
             parse,
             only_if_minified: false,
@@ -469,7 +472,68 @@ pub fn classpath(command_line: &str, p: &dyn Probe) -> Vec<PathBuf> {
     out
 }
 
-fn java_target(frame: &str, command_line: &str, exe: &str, p: &dyn Probe) -> Target {
+/// Where JDKs install, links resolved: the system's and the user's JDK folders, Homebrew's
+/// OpenJDKs, SDKMAN's, asdf's and jenv's.
+fn jdk_roots(p: &dyn Probe) -> Vec<PathBuf> {
+    let mut raw = vec![PathBuf::from("/Library/Java/JavaVirtualMachines")];
+    if let Some(h) = p.home() {
+        for d in [
+            "Library/Java/JavaVirtualMachines",
+            ".sdkman/candidates/java",
+            ".asdf/installs/java",
+            ".jenv",
+        ] {
+            raw.push(h.join(d));
+        }
+    }
+    for opt in ["/opt/homebrew/opt", "/usr/local/opt"] {
+        raw.extend(p.list(Path::new(opt)).into_iter().filter(|e| {
+            e.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains("openjdk"))
+        }));
+    }
+    raw.iter().filter_map(|r| p.canonical(r)).collect()
+}
+
+/// The `javap` beside the JVM's executable. The path comes from the process, so it's trusted
+/// only inside a JDK's install folder, owned by this user or root, with neither it nor its
+/// folder writable by anyone else. Otherwise detection's `javap` is used.
+fn own_javap(exe: &str, p: &dyn Probe) -> Option<PathBuf> {
+    if exe.is_empty() {
+        return None;
+    }
+    let beside = Path::new(exe).parent()?.join("javap");
+    if !p.is_file(&beside) {
+        return None;
+    }
+    let real = p.canonical(&beside)?;
+    let inside = |roots: &[PathBuf]| roots.iter().any(|r| real.starts_with(r));
+    if !inside(&jdk_roots(p))
+        && !inside(
+            &p.java_home()
+                .and_then(|h| p.canonical(&h))
+                .into_iter()
+                .collect::<Vec<_>>(),
+        )
+    {
+        return None;
+    }
+    let uid = p.uid();
+    let safe = |f: &Path| {
+        p.owner_mode(f)
+            .is_some_and(|(owner, mode)| (owner == uid || owner == 0) && mode & 0o022 == 0)
+    };
+    (safe(&real) && real.parent().is_some_and(safe)).then_some(real)
+}
+
+fn java_target(
+    frame: &str,
+    command_line: &str,
+    exe: &str,
+    p: &dyn Probe,
+    stop: &dyn Fn() -> bool,
+) -> Target {
     let Some(f) = parse_java(frame) else {
         return Target::Nothing(
             "This doesn't read as a Java frame (class.method(File.java:line)).".into(),
@@ -488,19 +552,24 @@ fn java_target(frame: &str, command_line: &str, exe: &str, p: &dyn Probe) -> Tar
         classpath(command_line, p)
     };
     let entry = format!("{}.class", f.class.replace('.', "/"));
-    let at = cp.iter().find_map(|e| {
+    let mut at = None;
+    for e in &cp {
+        if stop() {
+            break;
+        }
         let is_jar = e.extension().is_some_and(|x| x == "jar");
-        if is_jar {
+        let found = if is_jar {
             p.jar_has(e, &entry).then(|| ClassAt::Jar(e.clone()))
         } else {
             let file = e.join(&entry);
             p.is_file(&file).then_some(ClassAt::File(file))
+        };
+        if found.is_some() {
+            at = found;
+            break;
         }
-    });
-    let javap = Path::new(exe)
-        .parent()
-        .map(|bin| bin.join("javap"))
-        .filter(|j| !exe.is_empty() && p.is_file(j));
+    }
+    let javap = if stop() { None } else { own_javap(exe, p) };
     Target::Jvm(Jvm {
         class: f.class,
         method: f.method,
@@ -615,7 +684,16 @@ fn script_target(frame: &str, p: &dyn Probe) -> Target {
 }
 
 /// What a request points at. Reads only file metadata (and a jar's directory).
+#[cfg(test)]
 pub fn resolve(req: &Request, p: &dyn Probe) -> Target {
+    resolve_until(req, p, &|| false)
+}
+
+/// [`resolve`], giving up between steps once `stop` says so (cancelled or out of time).
+pub fn resolve_until(req: &Request, p: &dyn Probe, stop: &dyn Fn() -> bool) -> Target {
+    if stop() {
+        return Target::Nothing("Stopped before the frame was looked up.".into());
+    }
     match req {
         Request::Crash {
             frame,
@@ -626,7 +704,7 @@ pub fn resolve(req: &Request, p: &dyn Probe) -> Target {
             frame,
             command_line,
             exe,
-        } => java_target(frame, command_line, exe, p),
+        } => java_target(frame, command_line, exe, p, stop),
         Request::Script { frame } => script_target(frame, p),
     }
 }
@@ -1026,6 +1104,8 @@ fn jvm_steps(j: &Jvm, tools: &Tools) -> Result<Vec<Step>, NoView> {
                     Parse::JavaDecompiled,
                 )
             {
+                // Fernflower writes into a folder that must already be there.
+                st.dirs = vec!["out".into()];
                 st.output = Output::JavaIn("out".into());
                 steps.push(st);
             }
@@ -1100,6 +1180,7 @@ fn script_steps(sc: &Script, tools: &Tools) -> Result<Vec<Step>, NoView> {
             program: PathBuf::new(),
             args: Vec::new(),
             files: Vec::new(),
+            dirs: Vec::new(),
             output: Output::Read(path.clone()),
             parse: Parse::Source,
             only_if_minified: false,

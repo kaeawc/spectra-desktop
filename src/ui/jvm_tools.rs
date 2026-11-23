@@ -292,7 +292,6 @@ pub(super) fn threads(s: &App, r: &ThreadDumpReport, k: &Kit) -> El {
 
 // Heap histogram.
 
-/// A signed size: `+4 KB`, `−1.2 MB`.
 /// A Java frame; one with bytecode can show its code (`codeview.rs`).
 fn java_frame(pid: u32, f: &str, key: &str, k: &Kit) -> El {
     let has_code = crate::codeview_plan::parse_java(f).is_some_and(|j| !j.native);
@@ -316,6 +315,7 @@ fn java_frame(pid: u32, f: &str, key: &str, k: &Kit) -> El {
         )
 }
 
+/// A signed size: `+4 KB`, `−1.2 MB`.
 fn signed_bytes(d: i64) -> String {
     format!(
         "{}{}",

@@ -18,6 +18,12 @@ pub struct FakeRunner {
     pub calls: Mutex<Vec<(String, Vec<String>)>>,
     pub removed: Mutex<Vec<PathBuf>>,
     pub block: Option<String>,
+    /// Folders made.
+    pub dirs: Mutex<Vec<PathBuf>>,
+    /// A program that panics when run.
+    pub panics: Option<String>,
+    /// A program that takes this long.
+    pub slow: Option<(String, Duration)>,
 }
 
 impl FakeRunner {
@@ -61,6 +67,33 @@ impl Runner for FakeRunner {
             }
             return Err(Failure::Cancelled);
         }
+        if self.panics.as_deref() == Some(name.as_str()) {
+            panic!("{name} fell over");
+        }
+        if let Some((slow, d)) = &self.slow
+            && *slow == name
+        {
+            std::thread::sleep(*d);
+        }
+        // `java` running Fernflower: it writes into an `out` folder that must already exist.
+        if name == "java"
+            && let Some(out) = args.iter().find(|a| a.ends_with("/out"))
+        {
+            let out = PathBuf::from(out);
+            if !self.dirs.lock().unwrap().contains(&out) {
+                return Err(Failure::Failed(format!(
+                    "java: destination {} isn't a folder",
+                    out.display()
+                )));
+            }
+            if let Some(Ok(text)) = self.replies.get(&name) {
+                self.files
+                    .lock()
+                    .unwrap()
+                    .insert(out.join("Main.java"), text.clone());
+            }
+            return Ok(String::new());
+        }
         // A tool that writes its answer to a file in its temp folder.
         if let Some(out) = args.iter().find(|a| a.ends_with("/out.c")) {
             if let Some(Ok(text)) = self.replies.get(&name) {
@@ -93,6 +126,10 @@ impl Runner for FakeRunner {
             .lock()
             .unwrap()
             .insert(path.to_path_buf(), text.to_owned());
+        Ok(())
+    }
+    fn make_dir(&self, path: &Path) -> Result<(), String> {
+        self.dirs.lock().unwrap().push(path.to_path_buf());
         Ok(())
     }
     fn remove_temp(&self, dir: &Path) {
@@ -312,6 +349,165 @@ fn objdump_output_is_demangled() {
             "swift-demangle".into(),
             vec!["--compact".into(), "_$s6Ledger5EntryV4hashSivg".into()]
         )
+    );
+}
+
+const MAIN_CLASS: &str = "/srv/checkout/classes/com/acme/checkout/Main.class";
+
+fn java_main() -> Request {
+    Request::Java {
+        frame: "com.acme.checkout.Main.main(Main.java:9)".into(),
+        command_line: "java -cp /srv/checkout/classes com.acme.checkout.Main".into(),
+        exe: String::new(),
+    }
+}
+
+#[test]
+fn fernflower_gets_its_out_folder_made_first() {
+    let src = "package com.acme.checkout;\n\npublic class Main {\n    public static void main(String[] args) {\n        run();\n    }\n}\n";
+    let r = FakeRunner::new(&[("java", Ok(src))]);
+    let p = FakeProbe::new(&[], &[MAIN_CLASS]);
+    let tools = Tools::with(&[
+        (Tool::Java, "/usr/bin/java"),
+        (Tool::FernflowerJar, "/ide/java-decompiler.jar"),
+    ]);
+    let state = work(
+        &java_main(),
+        &r,
+        &p,
+        &cache_of(tools),
+        &AtomicBool::new(false),
+    );
+    let Some(State::Shown(sh)) = state else {
+        panic!("{state:?}")
+    };
+    assert_eq!(sh.what, "Java decompiled by Fernflower");
+    assert_eq!(
+        *r.dirs.lock().unwrap(),
+        [PathBuf::from("/tmp/fake-codeview-0/out")]
+    );
+}
+
+#[test]
+fn demangling_is_skipped_once_the_time_is_gone() {
+    let objdump = include_str!("../tests/fixtures/codeview/objdump.txt");
+    let mut r = FakeRunner::new(&[
+        ("llvm-objdump", Ok(objdump)),
+        (
+            "swift-demangle",
+            Ok("Ledger.Entry.hash.getter : Swift.Int\n"),
+        ),
+    ]);
+    // The disassembler uses up the whole budget.
+    r.slow = Some(("llvm-objdump".into(), Duration::from_millis(300)));
+    let bin = "/opt/tools/bin/ledgerd";
+    let p = FakeProbe::new(&[], &[bin]);
+    let tools = Tools::with(&[
+        (Tool::Objdump, "/x/llvm-objdump"),
+        (Tool::SwiftDemangle, "/x/swift-demangle"),
+    ]);
+    let req = Request::Crash {
+        frame: "ledgerd`ledger_flush + 24".into(),
+        process_path: bin.into(),
+    };
+    let state = work_within(
+        &req,
+        &r,
+        &p,
+        &cache_of(tools),
+        &AtomicBool::new(false),
+        Duration::from_millis(200),
+    );
+    assert!(matches!(state, Some(State::Shown(_))), "{state:?}");
+    assert_eq!(r.ran(), ["llvm-objdump"]);
+}
+
+#[test]
+fn looking_up_a_class_stops_between_jars_once_cancelled() {
+    let jars = [
+        "/srv/checkout/lib/a.jar",
+        "/srv/checkout/lib/b.jar",
+        "/srv/checkout/lib/c.jar",
+    ];
+    let p = FakeProbe::new(&[], &jars);
+    let cancel = AtomicBool::new(false);
+    /// Cancels the job on the first jar it reads.
+    struct Cancelling<'a>(&'a FakeProbe, &'a AtomicBool);
+    impl Probe for Cancelling<'_> {
+        fn path_dirs(&self) -> Vec<PathBuf> {
+            self.0.path_dirs()
+        }
+        fn home(&self) -> Option<PathBuf> {
+            self.0.home()
+        }
+        fn var(&self, n: &str) -> Option<String> {
+            self.0.var(n)
+        }
+        fn is_file(&self, f: &Path) -> bool {
+            self.0.is_file(f)
+        }
+        fn list(&self, d: &Path) -> Vec<PathBuf> {
+            self.0.list(d)
+        }
+        fn xcrun(&self, n: &str) -> Option<PathBuf> {
+            self.0.xcrun(n)
+        }
+        fn jar_has(&self, jar: &Path, entry: &str) -> bool {
+            self.1.store(true, Ordering::SeqCst);
+            self.0.jar_has(jar, entry)
+        }
+        fn canonical(&self, f: &Path) -> Option<PathBuf> {
+            self.0.canonical(f)
+        }
+        fn owner_mode(&self, f: &Path) -> Option<(u32, u32)> {
+            self.0.owner_mode(f)
+        }
+        fn uid(&self) -> u32 {
+            self.0.uid()
+        }
+        fn java_home(&self) -> Option<PathBuf> {
+            self.0.java_home()
+        }
+    }
+    let req = Request::Java {
+        frame: "com.acme.checkout.Main.main(Main.java:9)".into(),
+        command_line: "java -cp /srv/checkout/lib/* com.acme.checkout.Main".into(),
+        exe: String::new(),
+    };
+    let state = work(
+        &req,
+        &FakeRunner::new(&[]),
+        &Cancelling(&p, &cancel),
+        &cache_of(Tools::with(&[(Tool::Javap, "/usr/bin/javap")])),
+        &cancel,
+    );
+    assert_eq!(state, None);
+    assert_eq!(
+        *p.jars_read.lock().unwrap(),
+        1,
+        "no jar read once cancelled"
+    );
+}
+
+#[test]
+fn a_panicking_job_removes_its_temp_folder_and_lands_a_failure() {
+    let mut r = FakeRunner::new(&[]);
+    r.panics = Some("retdec-decompiler".into());
+    let (mut s, r) = app_with(
+        r,
+        FakeProbe::new(&[], &[APP, INK]),
+        Tools::with(&[(Tool::RetDec, "/r/retdec-decompiler")]),
+    );
+    s.codeview.threaded = false;
+    s.show_crash_code("InkKit`ink_stroke_commit + 8", APP);
+    assert_eq!(
+        *r.removed.lock().unwrap(),
+        [PathBuf::from("/tmp/fake-codeview-0")]
+    );
+    assert!(s.land_codeview());
+    assert_eq!(
+        s.codeview.open.as_ref().unwrap().state,
+        State::Nothing("The code view stopped unexpectedly.".into())
     );
 }
 

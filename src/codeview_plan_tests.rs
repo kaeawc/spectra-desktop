@@ -317,21 +317,21 @@ fn a_java_frame_finds_its_class_in_the_classpath() {
     let p = FakeProbe::new(
         &[],
         &[
-            "/opt/jdk-21/bin/java",
-            "/opt/jdk-21/bin/javap",
+            "/Library/Java/JavaVirtualMachines/jdk-21.jdk/Contents/Home/bin/java",
+            "/Library/Java/JavaVirtualMachines/jdk-21.jdk/Contents/Home/bin/javap",
             "/srv/checkout/lib/core.jar",
             "/srv/checkout/lib/inventory.jar",
             "/srv/checkout/lib/inventory.jar!com/acme/checkout/inventory/StockLedger.class",
             "/srv/checkout/classes/com/acme/checkout/Main.class",
         ],
     );
-    let cmd = "/opt/jdk-21/bin/java -Xmx2g -cp /srv/checkout/classes:/srv/checkout/lib/*:relative/x.jar com.acme.checkout.Main --port 8080";
+    let cmd = "/Library/Java/JavaVirtualMachines/jdk-21.jdk/Contents/Home/bin/java -Xmx2g -cp /srv/checkout/classes:/srv/checkout/lib/*:relative/x.jar com.acme.checkout.Main --port 8080";
     let java = |frame: &str| {
         resolve(
             &Request::Java {
                 frame: frame.into(),
                 command_line: cmd.into(),
-                exe: "/opt/jdk-21/bin/java".into(),
+                exe: "/Library/Java/JavaVirtualMachines/jdk-21.jdk/Contents/Home/bin/java".into(),
             },
             &p,
         )
@@ -354,7 +354,12 @@ fn a_java_frame_finds_its_class_in_the_classpath() {
         j.at,
         Some(ClassAt::Jar("/srv/checkout/lib/inventory.jar".into()))
     );
-    assert_eq!(j.javap.as_deref(), Some(Path::new("/opt/jdk-21/bin/javap")));
+    assert_eq!(
+        j.javap.as_deref(),
+        Some(Path::new(
+            "/Library/Java/JavaVirtualMachines/jdk-21.jdk/Contents/Home/bin/javap"
+        ))
+    );
     let t = Target::Jvm(j);
     let steps = plan(&t, &all_tools()).unwrap();
     // A jar: CFR filters it to the class, jadx takes one class; Procyon and Fernflower would
@@ -372,7 +377,10 @@ fn a_java_frame_finds_its_class_in_the_classpath() {
         ]
     );
     assert_eq!(steps[1].output, Output::JavaIn("out".into()));
-    assert_eq!(steps[2].program, Path::new("/opt/jdk-21/bin/javap"));
+    assert_eq!(
+        steps[2].program,
+        Path::new("/Library/Java/JavaVirtualMachines/jdk-21.jdk/Contents/Home/bin/javap")
+    );
     assert_eq!(
         steps[2].args,
         [
@@ -436,6 +444,85 @@ fn a_java_frame_finds_its_class_in_the_classpath() {
     bare.javap = None;
     let none = plan(&Target::Jvm(bare), &Tools::default()).unwrap_err();
     assert!(none.missing_tool && none.reason.contains("javap"));
+}
+
+/// The javap a JVM at `exe` gets, on a disk where `files` exist.
+fn javap_for(exe: &str, p: &FakeProbe) -> Option<PathBuf> {
+    let Target::Jvm(j) = resolve(
+        &Request::Java {
+            frame: "java.base/java.lang.Thread.run(Thread.java:1583)".into(),
+            command_line: String::new(),
+            exe: exe.into(),
+        },
+        p,
+    ) else {
+        panic!("a Java target")
+    };
+    j.javap
+}
+
+#[test]
+fn a_jvms_own_javap_is_trusted_only_inside_a_jdk() {
+    use crate::codeview_tools::tests::UID;
+    let sys = "/Library/Java/JavaVirtualMachines/jdk-21.jdk/Contents/Home/bin";
+    let sdk = "/Users/dev/.sdkman/candidates/java/21.0.5-tem/bin";
+    let brew = "/opt/homebrew/Cellar/openjdk@21/21.0.5/libexec/openjdk.jdk/Contents/Home/bin";
+    let dropped = "/tmp/drop/bin";
+    let mut p = FakeProbe::new(
+        &[],
+        &[
+            &format!("{sys}/javap"),
+            &format!("{sdk}/javap"),
+            &format!("{brew}/javap"),
+            &format!("{dropped}/javap"),
+            "/opt/homebrew/opt/openjdk@21/README",
+        ],
+    );
+    p.links = vec![(
+        PathBuf::from("/opt/homebrew/opt/openjdk@21"),
+        PathBuf::from("/opt/homebrew/Cellar/openjdk@21/21.0.5"),
+    )];
+    let own = |bin: &str| Some(PathBuf::from(format!("{bin}/javap")));
+    // The system's JDKs, the user's own (SDKMAN's), and Homebrew's through its link.
+    assert_eq!(javap_for(&format!("{sys}/java"), &p), own(sys));
+    p.modes = vec![
+        (PathBuf::from(format!("{sdk}/javap")), (UID, 0o755)),
+        (PathBuf::from(sdk), (UID, 0o755)),
+    ];
+    assert_eq!(javap_for(&format!("{sdk}/java"), &p), own(sdk));
+    assert_eq!(javap_for(&format!("{brew}/java"), &p), own(brew));
+    // A javap anywhere else is the process's choice, not a JDK's: detection's is used.
+    assert_eq!(javap_for(&format!("{dropped}/java"), &p), None);
+    let t = resolve(
+        &Request::Java {
+            frame: "java.base/java.lang.Thread.run(Thread.java:1583)".into(),
+            command_line: String::new(),
+            exe: format!("{dropped}/java"),
+        },
+        &p,
+    );
+    assert_eq!(
+        plan(&t, &all_tools()).unwrap()[0].program,
+        Path::new("/usr/bin/javap")
+    );
+    // Nor does `..` climb out of a JDK.
+    assert_eq!(
+        javap_for(
+            "/Library/Java/JavaVirtualMachines/../../tmp/drop/bin/java",
+            &p
+        ),
+        None
+    );
+    // java_home's answer counts as a JDK.
+    p.java_home = Some(PathBuf::from("/tmp/drop"));
+    assert_eq!(javap_for(&format!("{dropped}/java"), &p), own(dropped));
+    // Another user's javap, or one (or its folder) others can write, isn't trusted.
+    p.modes = vec![(PathBuf::from(format!("{sys}/javap")), (UID + 1, 0o755))];
+    assert_eq!(javap_for(&format!("{sys}/java"), &p), None);
+    p.modes = vec![(PathBuf::from(format!("{sys}/javap")), (0, 0o775))];
+    assert_eq!(javap_for(&format!("{sys}/java"), &p), None);
+    p.modes = vec![(PathBuf::from(sys), (UID, 0o757))];
+    assert_eq!(javap_for(&format!("{sys}/java"), &p), None);
 }
 
 #[test]

@@ -164,6 +164,18 @@ pub trait Probe: Send + Sync {
     fn xcrun(&self, name: &str) -> Option<PathBuf>;
     /// Whether the jar (a zip) at `jar` holds `entry`, such as `com/acme/Ledger.class`.
     fn jar_has(&self, jar: &Path, entry: &str) -> bool;
+    /// The path with its links and `..` resolved; none when it isn't there.
+    fn canonical(&self, p: &Path) -> Option<PathBuf>;
+    /// Who owns `p` and its permission bits, not following a link.
+    fn owner_mode(&self, p: &Path) -> Option<(u32, u32)>;
+    /// The user this app runs as.
+    fn uid(&self) -> u32;
+    /// The JDK `/usr/libexec/java_home` names.
+    fn java_home(&self) -> Option<PathBuf>;
+}
+
+unsafe extern "C" {
+    safe fn getuid() -> u32;
 }
 
 /// The real filesystem.
@@ -210,14 +222,57 @@ impl Probe for SystemProbe {
     fn jar_has(&self, jar: &Path, entry: &str) -> bool {
         zip_names(jar).is_some_and(|names| names.iter().any(|n| n == entry))
     }
+
+    fn canonical(&self, p: &Path) -> Option<PathBuf> {
+        std::fs::canonicalize(p).ok()
+    }
+
+    fn owner_mode(&self, p: &Path) -> Option<(u32, u32)> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::symlink_metadata(p).ok()?;
+        Some((m.uid(), m.mode()))
+    }
+
+    fn uid(&self) -> u32 {
+        getuid()
+    }
+
+    fn java_home(&self) -> Option<PathBuf> {
+        let cmd = std::process::Command::new("/usr/libexec/java_home");
+        let out = crate::run::run(cmd, Duration::from_secs(5), 64 * 1024).ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let p = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        p.is_absolute().then_some(p)
+    }
 }
 
-/// The entry names in a zip's central directory, reading only its tail. Nothing for a file that
-/// isn't a zip, is ZIP64, or is over 1 GB.
+/// `O_NONBLOCK`, so opening something that turned into a pipe since it was looked at can't wait.
+#[cfg(target_os = "macos")]
+const O_NONBLOCK: i32 = 0x0004;
+#[cfg(not(target_os = "macos"))]
+const O_NONBLOCK: i32 = 0o4000;
+
+/// The entry names in a zip's central directory, reading only its tail. Nothing for anything but
+/// a regular file (a pipe or device would never end), or a file that isn't a zip, is ZIP64, or is
+/// over 1 GB.
 pub fn zip_names(path: &Path) -> Option<Vec<String>> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
+    use std::os::unix::fs::OpenOptionsExt;
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let meta = f.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let len = meta.len();
     if !(22..=1 << 30).contains(&len) {
         return None;
     }
@@ -404,7 +459,17 @@ pub(crate) mod tests {
         pub xcrun: Vec<(String, PathBuf)>,
         pub home: Option<PathBuf>,
         pub asked: Mutex<Vec<String>>,
+        /// Links: a path under the key is really under the value.
+        pub links: Vec<(PathBuf, PathBuf)>,
+        /// Owner and mode by path; anything else is root's, 0o755.
+        pub modes: Vec<(PathBuf, (u32, u32))>,
+        pub java_home: Option<PathBuf>,
+        /// Calls to `jar_has`.
+        pub jars_read: Mutex<usize>,
     }
+
+    /// The user the fake runs as.
+    pub const UID: u32 = 501;
 
     impl FakeProbe {
         pub fn new(path: &[&str], files: &[&str]) -> FakeProbe {
@@ -452,9 +517,69 @@ pub(crate) mod tests {
                 .map(|(_, p)| p.clone())
         }
         fn jar_has(&self, jar: &Path, entry: &str) -> bool {
+            *self.jars_read.lock().unwrap() += 1;
             self.files
                 .contains(&PathBuf::from(format!("{}!{entry}", jar.display())))
         }
+        fn canonical(&self, p: &Path) -> Option<PathBuf> {
+            use std::path::Component;
+            let mut out = PathBuf::new();
+            for c in p.components() {
+                match c {
+                    Component::ParentDir => {
+                        out.pop();
+                    }
+                    Component::CurDir => {}
+                    c => out.push(c),
+                }
+                if let Some((_, to)) = self.links.iter().find(|(from, _)| *from == out) {
+                    out = to.clone();
+                }
+            }
+            Some(out)
+        }
+        fn owner_mode(&self, p: &Path) -> Option<(u32, u32)> {
+            Some(
+                self.modes
+                    .iter()
+                    .find(|(q, _)| q == p)
+                    .map_or((0, 0o755), |(_, m)| *m),
+            )
+        }
+        fn uid(&self) -> u32 {
+            UID
+        }
+        fn java_home(&self) -> Option<PathBuf> {
+            self.java_home.clone()
+        }
+    }
+
+    #[test]
+    fn a_jar_that_is_a_pipe_is_not_read() {
+        let dir = std::env::temp_dir().join(format!(
+            "spectra-desktop-zip-fifo-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("app.jar");
+        let made = std::process::Command::new("/usr/bin/mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let f = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(zip_names(&f));
+        });
+        let got = rx.recv_timeout(Duration::from_secs(3));
+        let _ = std::fs::remove_file(&fifo);
+        let _ = std::fs::remove_dir(&dir);
+        assert_eq!(
+            got,
+            Ok(None),
+            "a pipe is no zip, and reading it doesn't wait"
+        );
     }
 
     /// A stored (uncompressed) zip with these entries, empty, in the shape `jar` writes.

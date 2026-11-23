@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 
 use crate::app::App;
 use crate::codeview_parse::{demangle, mangled, minified, parse};
-use crate::codeview_plan::{NoView, Output, Parse, Request, Step, TMP, Target, plan, resolve};
+use crate::codeview_plan::{
+    NoView, Output, Parse, Request, Step, TMP, Target, plan, resolve_until,
+};
 use crate::codeview_tools::{Probe, SystemProbe, Tool, Tools, detect};
 use crate::groups::Nav;
 use crate::inspect::Failure;
@@ -42,6 +44,8 @@ pub trait Runner: Send + Sync {
     /// A new empty folder in the system temp folder.
     fn temp_dir(&self) -> Result<PathBuf, String>;
     fn write(&self, path: &Path, text: &str) -> Result<(), String>;
+    /// Makes a folder inside a temp folder.
+    fn make_dir(&self, path: &Path) -> Result<(), String>;
     /// Removes a folder [`Runner::temp_dir`] made, and what's in it.
     fn remove_temp(&self, dir: &Path);
     /// The first file under `dir` with extension `ext`.
@@ -120,6 +124,10 @@ impl Runner for System {
 
     fn write(&self, path: &Path, text: &str) -> Result<(), String> {
         std::fs::write(path, text).map_err(|e| format!("Couldn't write {}: {e}", path.display()))
+    }
+
+    fn make_dir(&self, path: &Path) -> Result<(), String> {
+        std::fs::create_dir(path).map_err(|e| format!("Couldn't make {}: {e}", path.display()))
     }
 
     fn remove_temp(&self, dir: &Path) {
@@ -303,6 +311,18 @@ fn with_temp(args: &[String], dir: Option<&Path>) -> Vec<String> {
     }
 }
 
+/// A step's temp folder, removed when this goes, even by a panic.
+struct Temp<'a> {
+    r: &'a dyn Runner,
+    dir: PathBuf,
+}
+
+impl Drop for Temp<'_> {
+    fn drop(&mut self) {
+        self.r.remove_temp(&self.dir);
+    }
+}
+
 /// Runs one step: its temp folder, files and command, and where its answer is. The folder is
 /// removed whatever happens.
 fn run_step(
@@ -314,34 +334,35 @@ fn run_step(
     if let Output::Read(p) = &st.output {
         return r.read(p, CAP).map_err(Failure::Failed);
     }
-    let dir = if st.needs_temp() {
-        Some(r.temp_dir().map_err(Failure::Failed)?)
+    let temp = if st.needs_temp() {
+        Some(Temp {
+            r,
+            dir: r.temp_dir().map_err(Failure::Failed)?,
+        })
     } else {
         None
     };
-    let result = (|| {
-        if let Some(d) = &dir {
-            for (name, text) in &st.files {
-                r.write(&d.join(name), text).map_err(Failure::Failed)?;
-            }
+    let dir = temp.as_ref().map(|t| t.dir.as_path());
+    if let Some(d) = dir {
+        for sub in &st.dirs {
+            r.make_dir(&d.join(sub)).map_err(Failure::Failed)?;
         }
-        let args = with_temp(&st.args, dir.as_deref());
-        let out = r.run(&st.program, &args, left, CAP, cancel)?;
-        match (&st.output, &dir) {
-            (Output::File(name), Some(d)) => r.read(&d.join(name), CAP).map_err(Failure::Failed),
-            (Output::JavaIn(sub), Some(d)) => {
-                let f = r
-                    .find(&d.join(sub), "java")
-                    .ok_or_else(|| Failure::Failed(format!("{} wrote no Java file", st.label())))?;
-                r.read(&f, CAP).map_err(Failure::Failed)
-            }
-            _ => Ok(out),
+        for (name, text) in &st.files {
+            r.write(&d.join(name), text).map_err(Failure::Failed)?;
         }
-    })();
-    if let Some(d) = &dir {
-        r.remove_temp(d);
     }
-    result
+    let args = with_temp(&st.args, dir);
+    let out = r.run(&st.program, &args, left, CAP, cancel)?;
+    match (&st.output, dir) {
+        (Output::File(name), Some(d)) => r.read(&d.join(name), CAP).map_err(Failure::Failed),
+        (Output::JavaIn(sub), Some(d)) => {
+            let f = r
+                .find(&d.join(sub), "java")
+                .ok_or_else(|| Failure::Failed(format!("{} wrote no Java file", st.label())))?;
+            r.read(&f, CAP).map_err(Failure::Failed)
+        }
+        _ => Ok(out),
+    }
 }
 
 /// Names a demangler can turn readable in disassembly lldb didn't print.
@@ -350,7 +371,7 @@ fn demangled(
     t: &Tools,
     parse: Parse,
     lines: &mut [String],
-    left: Duration,
+    left: &dyn Fn() -> Duration,
     cancel: &AtomicBool,
 ) {
     if !matches!(parse, Parse::Objdump | Parse::Otool) {
@@ -360,6 +381,11 @@ fn demangled(
         let Some(bin) = t.get(tool) else {
             continue;
         };
+        // Measured again for each: the step before may have used it all.
+        let left = left();
+        if left.is_zero() {
+            return;
+        }
         let names = mangled(lines, swift);
         if names.is_empty() {
             continue;
@@ -385,8 +411,32 @@ pub fn work(
     cache: &Mutex<Option<Arc<Tools>>>,
     cancel: &AtomicBool,
 ) -> Option<State> {
+    work_within(req, runner, probe, cache, cancel, DEADLINE)
+}
+
+/// [`work`], within `budget` rather than [`DEADLINE`].
+fn work_within(
+    req: &Request,
+    runner: &dyn Runner,
+    probe: &dyn Probe,
+    cache: &Mutex<Option<Arc<Tools>>>,
+    cancel: &AtomicBool,
+    budget: Duration,
+) -> Option<State> {
     let start = Instant::now();
-    let target = resolve(req, probe);
+    let time_left = || budget.saturating_sub(start.elapsed());
+    let target = resolve_until(req, probe, &|| {
+        cancel.load(Ordering::SeqCst) || time_left().is_zero()
+    });
+    if cancel.load(Ordering::SeqCst) {
+        return None;
+    }
+    if time_left().is_zero() {
+        return Some(State::Nothing(format!(
+            "Looking the frame up took longer than {} s and was stopped.",
+            budget.as_secs_f64().round()
+        )));
+    }
     let mut t = tools(cache, probe, false);
     let mut planned = plan(&target, &t);
     // Nothing found to run: look again, in case something was installed since.
@@ -406,7 +456,7 @@ pub fn work(
         if cancel.load(Ordering::SeqCst) {
             return None;
         }
-        let left = DEADLINE.saturating_sub(start.elapsed());
+        let left = time_left();
         if left.is_zero() {
             tried.push(format!("{}: out of time", st.label()));
             break;
@@ -428,7 +478,7 @@ pub fn work(
         };
         match parse(st.parse, &out, &target) {
             Ok(mut p) => {
-                demangled(runner, &t, st.parse, &mut p.lines, left, cancel);
+                demangled(runner, &t, st.parse, &mut p.lines, &time_left, cancel);
                 return Some(State::Shown(Shown {
                     what: st.parse.what(st.label()),
                     lines: p.lines,
@@ -482,7 +532,11 @@ impl App {
             c.tx.clone(),
         );
         let go = move || {
-            let answer = work(&req, runner.as_ref(), probe.as_ref(), &cache, &cancel);
+            // A panic in a tool's handling still lands, so the panel doesn't wait forever.
+            let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                work(&req, runner.as_ref(), probe.as_ref(), &cache, &cancel)
+            }))
+            .unwrap_or_else(|_| Some(State::Nothing("The code view stopped unexpectedly.".into())));
             let _ = tx.send(Landed { job, answer });
         };
         if !c.threaded {
