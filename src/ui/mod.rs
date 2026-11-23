@@ -5,6 +5,7 @@ mod activity;
 mod app_page;
 mod card;
 mod chart;
+mod codeview;
 mod compare;
 mod crash_strip;
 mod crashes;
@@ -23,6 +24,8 @@ mod system;
 mod tests;
 #[cfg(test)]
 mod tests_activity;
+#[cfg(test)]
+mod tests_codeview;
 #[cfg(test)]
 mod tests_compare;
 #[cfg(test)]
@@ -63,6 +66,14 @@ use card::dot;
 /// Keys nothing focused took: the sidebar toggle, Esc or Cmd-[ to go back from a page, and
 /// ⌥⌘Q to open the Quit confirmation (which a key never answers on its own).
 pub fn on_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    if s.codeview.open.is_some() {
+        // Esc closes the code view (and stops its tools) rather than going back.
+        if ev.key == Key::Escape {
+            s.close_code();
+            return true;
+        }
+        return false;
+    }
     if s.startup.confirm.is_some() {
         // Like Quit's: Esc cancels the Disable or Enable confirmation; nothing else answers it.
         if ev.key == Key::Escape {
@@ -318,6 +329,7 @@ pub fn view(s: &App, cx: &mut Cx<App>) -> El {
     let mut layer = Vec::new();
     quit::dialog(s, &k, &mut layer);
     startup::dialog(s, &k, &mut layer);
+    codeview::dialog(s, &k, &mut layer);
     root(split, layer)
 }
 
