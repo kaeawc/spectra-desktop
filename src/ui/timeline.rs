@@ -11,7 +11,7 @@ use super::tools::failed;
 use crate::app::App;
 use crate::procs::fmt_count;
 use crate::timeline::{
-    DEADLINE, Filter, Go, Kind, Row, SLOW_BEFORE, Timeline, Window, ago, around, clock,
+    DEADLINE, Filter, Go, Kind, Row, SLOW_BEFORE, Slow, Timeline, Window, ago, around, clock,
 };
 
 /// Rows drawn at once; a kind or a shorter window narrows the rest.
@@ -31,17 +31,25 @@ pub fn page(s: &App, k: &Kit) -> El {
         .child(controls(s, k));
     let onset = s.slow_since();
     let wall = (s.wall)();
-    if let Some(at) = onset {
-        let offset = s
-            .timeline
-            .data
-            .as_ref()
-            .and_then(|d| d.0.offset)
-            .unwrap_or(0);
+    if let Some(slow) = onset {
+        let at = slow.at;
+        let since = if slow.fresh {
+            " and is still there".to_owned()
+        } else {
+            let last = s
+                .system
+                .load
+                .updated
+                .map_or(0, |u| (s.now - u).round() as i64);
+            format!(
+                "; the last load reading was {}, so it may have eased since",
+                ago(last)
+            )
+        };
         let body = format!(
-            "The load climbed past one per core {} ({}) and is still there. Rows from the {} minutes before are marked.",
+            "The load climbed past one per core {} ({}){since}. Rows from the {} minutes before are marked.",
             ago(wall - at),
-            clock(at, wall, offset),
+            clock(at, wall, s.timeline_offset(at)),
             SLOW_BEFORE / 60
         );
         page = page.child(callout("tl-slow", "Things got slow", &body, k));
@@ -119,7 +127,7 @@ fn controls(s: &App, k: &Kit) -> El {
         .child(refresh)
 }
 
-fn rows(s: &App, tl: &Timeline, w: Window, read_at: i64, onset: Option<i64>, k: &Kit) -> El {
+fn rows(s: &App, tl: &Timeline, w: Window, read_at: i64, onset: Option<Slow>, k: &Kit) -> El {
     let c = &k.c;
     let filter = s.timeline.filter;
     let mut body = col().key("tl-body").w_full().gap(10.0);
@@ -184,7 +192,6 @@ fn rows(s: &App, tl: &Timeline, w: Window, read_at: i64, onset: Option<i64>, k: 
             .key("tl-no-match"),
         );
     }
-    let offset = tl.offset.unwrap_or(0);
     let now = (s.wall)();
     let mut list = col()
         .key("tl-rows")
@@ -194,8 +201,8 @@ fn rows(s: &App, tl: &Timeline, w: Window, read_at: i64, onset: Option<i64>, k: 
         .fill(c.bg_base)
         .py(4.0);
     for (i, r) in shown.iter().take(SHOWN).enumerate() {
-        let slow = onset.is_some_and(|at| around(r, at));
-        list = list.child(line(s, i, r, now, offset, slow, k));
+        let slow = onset.is_some_and(|o| around(r, o.at));
+        list = list.child(line(s, i, r, now, s.timeline_offset(r.at), slow, k));
     }
     body = body.child(list);
     if shown.len() > SHOWN {

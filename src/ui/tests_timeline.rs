@@ -258,3 +258,46 @@ fn a_failed_timeline_shows_why() {
         Some("spectra took longer than 90 s and was stopped")
     );
 }
+
+#[test]
+fn a_start_whose_pid_now_runs_under_another_name_does_not_link() {
+    let (mut rt, _) = scene_with(
+        |s| {
+            timeline_scene(s);
+            // pid 901 is Slack Helper (Renderer) in the sample; say it started as something else.
+            let tl = &mut s.timeline.data.as_mut().unwrap().0;
+            let row = tl.rows.iter_mut().find(|r| r.pid == Some(901)).unwrap();
+            row.process = "Example Worker".into();
+        },
+        ok(),
+    );
+    let row = rt.state.timeline.data.as_ref().unwrap().0.rows.clone();
+    let row = row.iter().find(|r| r.pid == Some(901)).unwrap();
+    assert!(rt.state.process(901).is_some(), "the pid itself still runs");
+    assert_eq!(rt.state.timeline_go(row), None);
+    assert!(has(&mut rt, &format!("tl-row-{}", row.id())));
+    assert!(!has(&mut rt, &format!("tl-go-{}", row.id())));
+}
+
+#[test]
+fn a_stale_load_reading_doesnt_say_it_is_still_slow() {
+    let (mut rt, _) = scene_with(timeline_scene, ok());
+    let fresh = text_of(&mut rt, "tl-slow").unwrap_or_default();
+    let all = |rt: &Runtime<App>| {
+        rt.elements()
+            .into_iter()
+            .filter_map(|e| e.text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert!(all(&rt).contains("and is still there"), "{fresh}");
+    // Ten minutes pass with no load reading (the window hidden): the note says how old it is.
+    rt.update(|s, _| s.now += 600.0);
+    settle(&mut rt);
+    let text = all(&rt);
+    assert!(!text.contains("and is still there"), "{text}");
+    assert!(
+        text.contains("the last load reading was 10 min ago"),
+        "{text}"
+    );
+}

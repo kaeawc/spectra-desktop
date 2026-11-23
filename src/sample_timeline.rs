@@ -20,6 +20,8 @@ fn timeline_page(s: &mut App, w: Window) {
     s.select(None);
     s.nav = Nav::Timeline;
     s.timeline.window = w;
+    // The sample's Mac is five hours behind UTC, wherever the scene is rendered.
+    s.timeline.local = |_| Some(-5 * 3600);
 }
 
 fn landed(s: &mut App, w: Window, timeline: &str, updates: &str) {

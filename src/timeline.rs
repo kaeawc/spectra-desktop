@@ -561,27 +561,131 @@ pub enum Go {
     App(String),
 }
 
-/// When the load last climbed past one per core and has stayed there, in Unix seconds, from the
-/// Machine page's load history (a reading every 5 s, six minutes kept). None when it isn't high
-/// now, or it was already high when the history begins, so when it climbed isn't known.
+/// Readings further apart than this many times their interval leave a gap the load history
+/// can't see into: the window was hidden, or readings failed.
+pub const GAP: f64 = 3.0;
+
+/// A climb the load history saw.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Slow {
+    /// When the load climbed, in Unix seconds.
+    pub at: i64,
+    /// Whether the last reading is recent enough to say it's still high.
+    pub fresh: bool,
+}
+
+/// When the load last climbed past one per core and has stayed there, from the Machine page's
+/// load history: `(window clock it landed, 1-minute load)`, oldest first, read every `every`
+/// seconds while the window shows. None when it isn't high in the last reading, it was already
+/// high when the history begins, or a gap in the readings (the window hidden, a failed read)
+/// falls where it climbed or since, so when isn't known.
 pub fn slow_since(
-    loads: &[f64],
+    points: &[(f64, f64)],
     cpus: u32,
-    updated_ago: f64,
     every: f64,
+    now: f64,
     wall: i64,
-) -> Option<i64> {
+) -> Option<Slow> {
     if cpus == 0 {
         return None;
     }
-    let high = |l: &f64| *l >= f64::from(cpus);
-    let run = loads.iter().rev().take_while(|l| high(l)).count();
-    if run == 0 || run == loads.len() {
+    let high = |l: f64| l >= f64::from(cpus);
+    let run = points.iter().rev().take_while(|p| high(p.1)).count();
+    if run == 0 || run == points.len() {
         return None;
     }
-    // The first high reading landed `run - 1` readings before the last one.
-    let back = updated_ago + every * (run - 1) as f64;
-    Some(wall - back.round() as i64)
+    let first = points.len() - run;
+    // The calm reading before the climb and every high one since, with no gap between.
+    if points[first - 1..]
+        .windows(2)
+        .any(|w| w[1].0 - w[0].0 > every * GAP)
+    {
+        return None;
+    }
+    let last = points.last()?.0;
+    Some(Slow {
+        at: wall - (now - points[first].0).round() as i64,
+        fresh: now - last <= every * GAP,
+    })
+}
+
+/// Transitions of the Mac's time zone: `(from Unix seconds, seconds east)`, oldest first.
+type Zone = Vec<(i64, i64)>;
+
+/// Reads a compiled time zone file (TZif, as in `/etc/localtime`): its 64-bit block when it has
+/// one, else the 32-bit one. Before the first transition the first standard-time type holds.
+pub fn parse_tzif(b: &[u8]) -> Option<Zone> {
+    fn be(b: &[u8], at: usize, n: usize) -> Option<i64> {
+        let s = b.get(at..at + n)?;
+        Some(match n {
+            4 => i64::from(i32::from_be_bytes(s.try_into().ok()?)),
+            _ => i64::from_be_bytes(s.try_into().ok()?),
+        })
+    }
+    fn counts(b: &[u8], at: usize) -> Option<[usize; 6]> {
+        if b.get(at..at + 4)? != b"TZif" {
+            return None;
+        }
+        let mut c = [0usize; 6];
+        for (i, v) in c.iter_mut().enumerate() {
+            *v = usize::try_from(be(b, at + 20 + i * 4, 4)?).ok()?;
+        }
+        Some(c)
+    }
+    // isutcnt, isstdcnt, leapcnt, timecnt, typecnt, charcnt.
+    let c = counts(b, 0)?;
+    let (mut at, mut n) = (44, 4);
+    if *b.get(4)? >= b'2' {
+        let v1 = c[3] * 5 + c[4] * 6 + c[5] + c[2] * 8 + c[1] + c[0];
+        at = 44 + v1;
+        n = 8;
+    }
+    let c = if n == 8 { counts(b, at)? } else { c };
+    let at = if n == 8 { at + 44 } else { at };
+    let (times, types) = (c[3], c[4]);
+    if types == 0 {
+        return None;
+    }
+    let idx_at = at + times * n;
+    let info_at = idx_at + times;
+    let utoff = |t: usize| be(b, info_at + t * 6, 4);
+    let dst = |t: usize| b.get(info_at + t * 6 + 4).copied();
+    let first = (0..types).find(|t| dst(*t) == Some(0)).unwrap_or(0);
+    let mut zone = vec![(i64::MIN, utoff(first)?)];
+    for i in 0..times {
+        let t = usize::from(*b.get(idx_at + i)?);
+        if t >= types {
+            return None;
+        }
+        zone.push((be(b, at + i * n, n)?, utoff(t)?));
+    }
+    Some(zone)
+}
+
+/// The offset `zone` gives at `at`.
+pub fn zone_offset(zone: &[(i64, i64)], at: i64) -> Option<i64> {
+    zone.iter().rev().find(|(from, _)| *from <= at).map(|z| z.1)
+}
+
+/// The Mac's own offset from UTC at `at`, in seconds east, from its time zone file (`TZ` when
+/// it names a zone, else `/etc/localtime`), read once. None when it can't be read.
+pub fn local_offset(at: i64) -> Option<i64> {
+    static ZONE: std::sync::OnceLock<Option<Zone>> = std::sync::OnceLock::new();
+    let zone = ZONE.get_or_init(|| {
+        let path = match std::env::var("TZ") {
+            Ok(tz) if !tz.trim_start_matches(':').is_empty() && !tz.contains("..") => {
+                let tz = tz.trim_start_matches(':');
+                if tz.starts_with('/') {
+                    tz.to_owned()
+                } else {
+                    format!("/usr/share/zoneinfo/{tz}")
+                }
+            }
+            _ => "/etc/localtime".to_owned(),
+        };
+        parse_tzif(&std::fs::read(path).ok()?)
+    });
+    zone_offset(zone.as_ref()?, at)
 }
 
 /// Whether a row happened around when the load climbed at `onset`.
@@ -647,6 +751,8 @@ pub struct TimelinePage {
     pub spectra: Arc<dyn Spectra>,
     /// False in tests: a reading runs on the calling thread.
     pub threaded: bool,
+    /// The Mac's offset from UTC at a time; sample scenes fix it so they render the same anywhere.
+    pub local: fn(i64) -> Option<i64>,
     flight: Option<Flight>,
     job: u64,
     tx: Sender<Landed>,
@@ -669,6 +775,7 @@ impl TimelinePage {
             error: None,
             spectra: Arc::new(crate::inspect::System),
             threaded: true,
+            local: local_offset,
             flight: None,
             job: 0,
             tx,
@@ -819,17 +926,30 @@ impl App {
     }
 
     /// When the load climbed, if it's high now and the Machine page's history saw it climb.
-    pub fn slow_since(&self) -> Option<i64> {
+    pub fn slow_since(&self) -> Option<Slow> {
         let load = &self.system.load;
-        let (last, updated) = (load.last.as_ref()?, load.updated?);
-        let loads: Vec<f64> = self.system.cpu_history.iter().map(|p| p.load1).collect();
+        let last = load.last.as_ref()?;
+        let points: Vec<(f64, f64)> = self
+            .system
+            .cpu_history
+            .iter()
+            .map(|p| (p.at, p.load1))
+            .collect();
         slow_since(
-            &loads,
+            &points,
             last.cpus,
-            self.now - updated,
             load.every.as_secs_f64(),
+            self.now,
             (self.wall)(),
         )
+    }
+
+    /// The offset a clock time on the page is shown in: the Mac's own, else what Spectra's times
+    /// carried, else UTC.
+    pub fn timeline_offset(&self, at: i64) -> i64 {
+        (self.timeline.local)(at)
+            .or_else(|| self.timeline.data.as_ref().and_then(|d| d.0.offset))
+            .unwrap_or(0)
     }
 
     pub fn follow_timeline(&mut self, go: Go) {
@@ -1054,13 +1174,48 @@ pub(crate) mod tests {
 
     #[test]
     fn the_load_onset_is_where_it_last_climbed() {
-        // Calm, then high for the last three readings; the last landed 2 s ago.
-        let loads = [2.0, 3.0, 9.0, 12.0, 11.0];
-        assert_eq!(slow_since(&loads, 8, 2.0, 5.0, NOW), Some(NOW - 12));
+        // Calm, then high for the last three readings, 5 s apart; the last landed 2 s ago.
+        let pts = |l: &[(f64, f64)]| l.to_vec();
+        let loads = pts(&[
+            (80.0, 2.0),
+            (85.0, 3.0),
+            (90.0, 9.0),
+            (95.0, 12.0),
+            (100.0, 11.0),
+        ]);
+        let slow = slow_since(&loads, 8, 5.0, 102.0, NOW).unwrap();
+        assert_eq!(
+            slow,
+            Slow {
+                at: NOW - 12,
+                fresh: true
+            }
+        );
         // Not high now, high all along, or no cores: not known.
-        assert_eq!(slow_since(&[9.0, 2.0], 8, 0.0, 5.0, NOW), None);
-        assert_eq!(slow_since(&[9.0, 9.0], 8, 0.0, 5.0, NOW), None);
-        assert_eq!(slow_since(&loads, 0, 0.0, 5.0, NOW), None);
+        assert_eq!(
+            slow_since(&pts(&[(0.0, 9.0), (5.0, 2.0)]), 8, 5.0, 5.0, NOW),
+            None
+        );
+        assert_eq!(
+            slow_since(&pts(&[(0.0, 9.0), (5.0, 9.0)]), 8, 5.0, 5.0, NOW),
+            None
+        );
+        assert_eq!(slow_since(&loads, 0, 5.0, 102.0, NOW), None);
+        // The window was hidden for an hour around the climb: when isn't known, rather than
+        // placed at the first reading after the gap.
+        let hidden = pts(&[(0.0, 2.0), (3600.0, 9.0), (3605.0, 9.0)]);
+        assert_eq!(slow_since(&hidden, 8, 5.0, 3606.0, NOW), None);
+        let gap_since = pts(&[(0.0, 2.0), (5.0, 9.0), (3600.0, 9.0)]);
+        assert_eq!(slow_since(&gap_since, 8, 5.0, 3600.0, NOW), None);
+        // A climb seen without gaps, but the last reading is ten minutes old: not "still" high.
+        let stale = slow_since(&loads, 8, 5.0, 700.0, NOW).unwrap();
+        assert_eq!(
+            stale,
+            Slow {
+                at: NOW - 610,
+                fresh: false
+            }
+        );
         let onset = NOW - 4 * 60;
         let t = sample();
         let marked: Vec<String> = t
@@ -1101,6 +1256,61 @@ pub(crate) mod tests {
             Err(Failure::Failed(why)) if why.contains("90 s")
         ));
         assert_eq!(failed.calls().len(), 1, "no history without a timeline");
+    }
+
+    /// A TZif file: version 2 with an empty 32-bit block, then 64-bit data for New York's 2026
+    /// switches (EST -5 h, EDT -4 h).
+    fn tzif() -> Vec<u8> {
+        let header = |times: u32, types: u32, chars: u32| {
+            let mut h = b"TZif2".to_vec();
+            h.extend([0u8; 15]);
+            for c in [0, 0, 0, times, types, chars] {
+                h.extend(u32::to_be_bytes(c));
+            }
+            h
+        };
+        let mut b = header(0, 1, 4);
+        b.extend([0, 0, 0, 0, 0, 0]);
+        b.extend(b"UTC\0");
+        b.extend(header(2, 2, 8));
+        // 2026-03-08T07:00Z to EDT, 2026-11-01T06:00Z back to EST.
+        for t in [1_772_953_200i64, 1_793_512_800] {
+            b.extend(t.to_be_bytes());
+        }
+        b.extend([1, 0]);
+        for (off, dst, idx) in [(-5 * 3600i32, 0u8, 0u8), (-4 * 3600, 1, 4)] {
+            b.extend(off.to_be_bytes());
+            b.extend([dst, idx]);
+        }
+        b.extend(b"EST\0EDT\0");
+        b.extend(b"\nEST5EDT\n");
+        b
+    }
+
+    #[test]
+    fn the_macs_zone_gives_clock_times_not_utc() {
+        let zone = parse_tzif(&tzif()).unwrap();
+        // Summer is EDT, the sample's November is EST, and before any switch it's standard time.
+        assert_eq!(zone_offset(&zone, 1_783_000_000), Some(-4 * 3600));
+        assert_eq!(zone_offset(&zone, NOW), Some(-5 * 3600));
+        assert_eq!(zone_offset(&zone, 0), Some(-5 * 3600));
+        assert!(parse_tzif(b"not a zone").is_none());
+        // A reading with only UTC times still shows the Mac's clock.
+        let events = parse_timeline(
+            r#"{"events": [{"time": "2026-11-20T11:52:00Z", "source": "update", "summary": "installed Slack 4.41.105"}]}"#,
+        )
+        .unwrap();
+        let mut s = crate::app::init();
+        s.timeline.data = Some((merge(&events, None, 0), Window::Day, NOW));
+        assert_eq!(s.timeline.data.as_ref().unwrap().0.offset, None);
+        s.timeline.local = |_| Some(-5 * 3600);
+        let at = s.timeline.data.as_ref().unwrap().0.rows[0].at;
+        assert_eq!(clock(at, NOW, s.timeline_offset(at)), "06:52");
+        // Only when the Mac's zone can't be read does Spectra's own offset, then UTC, stand in.
+        s.timeline.local = |_| None;
+        assert_eq!(clock(at, NOW, s.timeline_offset(at)), "11:52");
+        // And the real one reads on this machine.
+        assert!(local_offset(NOW).is_some_and(|o| o.abs() <= 14 * 3600));
     }
 
     #[test]
