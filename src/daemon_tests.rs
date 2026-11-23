@@ -923,9 +923,13 @@ fn acknowledging_sends_the_id_once_and_never_retries_through_the_cli() {
     );
     assert_eq!(f.calls("alerts.ack").len(), 2);
     // No id, no call.
+    // An answer that is an error, not `None` (which would run the CLI and write).
     assert!(
-        d.answer(&["alerts", "ack", "--json"], SEC, &never())
-            .is_none_or(|r| r.is_err())
+        matches!(
+            d.answer(&["alerts", "ack", "--json"], SEC, &never()),
+            Some(Err(Error::Shape(_)))
+        ),
+        "a CLI fallback would fail this"
     );
     assert_eq!(f.calls("alerts.ack").len(), 2);
 }

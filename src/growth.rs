@@ -11,6 +11,7 @@
 //! Spectra call goes through [`crate::inspect::Spectra`] and so through the daemon seam in
 //! [`crate::daemon`], which answers the alert calls from the daemon.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -261,6 +262,9 @@ pub struct Growth {
     /// The alert being acknowledged, and how the last acknowledgement went.
     pub acking: Option<String>,
     pub outcome: Option<AckOutcome>,
+    /// Alerts acknowledged this run: a list read before the press but landing after it must not
+    /// bring the button back.
+    acked: HashSet<String>,
 }
 
 impl Growth {
@@ -282,6 +286,7 @@ impl Growth {
             shown: None,
             acking: None,
             outcome: None,
+            acked: HashSet::new(),
         }
     }
 
@@ -311,6 +316,14 @@ impl Default for Growth {
     fn default() -> Self {
         Growth::new()
     }
+}
+
+/// What a call says when it panicked: a failure the page shows, so it never waits forever.
+const INTERNAL: &str = "Spectra Desktop hit an internal error reading it.";
+
+/// `work`, with `failed` standing in for its answer if it panics.
+fn guarded(work: impl FnOnce() -> Landed + Send + 'static, failed: Landed) -> Work {
+    Box::new(move || std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or(failed))
 }
 
 fn check(spectra: &dyn Spectra, cancel: &AtomicBool) -> Result<Vec<Anomaly>, Note> {
@@ -395,7 +408,10 @@ impl App {
     /// Opens the page: the next tick looks at once.
     pub fn open_growth(&mut self) {
         self.growth.next = 0.0;
-        self.growth.outcome = None;
+        // An acknowledgement still out keeps its line, so its answer has somewhere to land.
+        if self.growth.acking.is_none() {
+            self.growth.outcome = None;
+        }
     }
 
     /// Lands finished calls, stops a look in flight once the page is off screen, and starts the
@@ -443,17 +459,29 @@ impl App {
         });
         let jumps: Work = {
             let (spectra, cancel) = (Arc::clone(&g.spectra), Arc::clone(&cancel));
-            Box::new(move || Landed::Look {
-                job,
-                part: Part::Jumps(check(&*spectra, &cancel)),
-            })
+            guarded(
+                move || Landed::Look {
+                    job,
+                    part: Part::Jumps(check(&*spectra, &cancel)),
+                },
+                Landed::Look {
+                    job,
+                    part: Part::Jumps(Err(Note::Failed(INTERNAL.into()))),
+                },
+            )
         };
         let alerts: Work = {
             let (spectra, cancel) = (Arc::clone(&g.spectra), cancel);
-            Box::new(move || Landed::Look {
-                job,
-                part: Part::Alerts(history(&*spectra, &cancel)),
-            })
+            guarded(
+                move || Landed::Look {
+                    job,
+                    part: Part::Alerts(history(&*spectra, &cancel)),
+                },
+                Landed::Look {
+                    job,
+                    part: Part::Alerts(Err(INTERNAL.into())),
+                },
+            )
         };
         self.run_growth(vec![jumps, alerts], "spectra-growth");
     }
@@ -479,14 +507,21 @@ impl App {
             status: AckStatus::Sending,
         });
         let (spectra, id) = (Arc::clone(&g.spectra), id.to_owned());
-        let work: Work = Box::new(move || {
-            let result = match spectra.run(&ack_args(&id), DEADLINE, &AtomicBool::new(false)) {
-                Ok(out) => parse_alert(&out),
-                Err(Failure::Cancelled) => Err("Stopped.".into()),
-                Err(Failure::Failed(why)) => Err(why),
-            };
-            Landed::Ack { id, result }
-        });
+        let failed = Landed::Ack {
+            id: id.clone(),
+            result: Err(INTERNAL.into()),
+        };
+        let work = guarded(
+            move || {
+                let result = match spectra.run(&ack_args(&id), DEADLINE, &AtomicBool::new(false)) {
+                    Ok(out) => parse_alert(&out),
+                    Err(Failure::Cancelled) => Err("Stopped.".into()),
+                    Err(Failure::Failed(why)) => Err(why),
+                };
+                Landed::Ack { id, result }
+            },
+            failed,
+        );
         self.run_growth(vec![work], "spectra-ack");
     }
 
@@ -501,9 +536,7 @@ impl App {
             let spawned = std::thread::Builder::new().name(name.into()).spawn({
                 let tx = tx.clone();
                 move || {
-                    if let Ok(landed) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(w)) {
-                        let _ = tx.send(landed);
-                    }
+                    let _ = tx.send(w());
                     if let Some(wake) = wake {
                         wake();
                     }
@@ -546,7 +579,10 @@ impl App {
                 g.jumps_note = Some(Note::NotEnough);
             }
             Part::Jumps(Err(note)) => g.jumps_note = Some(note),
-            Part::Alerts(Ok(list)) => {
+            Part::Alerts(Ok(mut list)) => {
+                for a in list.iter_mut().filter(|a| g.acked.contains(&a.id)) {
+                    a.acked_at.get_or_insert_with(|| format!("{now}"));
+                }
                 g.alerts = Some((list, now));
                 g.alerts_error = None;
             }
@@ -562,12 +598,9 @@ impl App {
             return false;
         }
         g.acking = None;
-        let Some(o) = g.outcome.as_mut() else {
-            return true;
-        };
         match result {
             Ok(done) => {
-                o.status = AckStatus::Done;
+                g.acked.insert(id.to_owned());
                 if let Some((list, _)) = g.alerts.as_mut()
                     && let Some(a) = list.iter_mut().find(|a| a.id == id)
                 {
@@ -577,8 +610,15 @@ impl App {
                         .filter(|t| !t.is_empty())
                         .or(Some(format!("{now}")));
                 }
+                if let Some(o) = g.outcome.as_mut() {
+                    o.status = AckStatus::Done;
+                }
             }
-            Err(why) => o.status = AckStatus::Failed(why),
+            Err(why) => {
+                if let Some(o) = g.outcome.as_mut() {
+                    o.status = AckStatus::Failed(why);
+                }
+            }
         }
         true
     }
@@ -964,5 +1004,96 @@ pub(crate) mod tests {
         s.tick_growth();
         assert!(s.growth.running());
         assert!(s.growth.outcome.is_none());
+    }
+
+    #[test]
+    fn leaving_and_returning_before_the_answer_lands_keeps_the_outcome_and_the_mark() {
+        let (mut s, _) = faked(&[
+            ("anomalies", Ok(ANOMALIES)),
+            ("alerts --json", Ok(ALERTS)),
+            (
+                "alerts ack",
+                Ok(r#"{"id":"0a1","acked_at":"2026-11-20T11:59:00Z"}"#),
+            ),
+        ]);
+        s.tick_growth();
+        s.run_held_growth();
+        let id = s
+            .growth
+            .alerts
+            .as_ref()
+            .unwrap()
+            .0
+            .iter()
+            .find(|a| a.active())
+            .unwrap()
+            .id
+            .clone();
+        s.ack_alert(&id);
+        // Away and back while it is out.
+        s.nav = Nav::All;
+        s.open_growth();
+        s.nav = Nav::Growth;
+        assert!(s.growth.outcome.is_some(), "kept while acking");
+        s.run_held_growth();
+        assert_eq!(s.growth.outcome.as_ref().unwrap().status, AckStatus::Done);
+        assert!(
+            s.growth
+                .alerts
+                .as_ref()
+                .unwrap()
+                .0
+                .iter()
+                .find(|a| a.id == id)
+                .unwrap()
+                .acknowledged()
+        );
+        // And once it landed, opening again clears the line.
+        s.open_growth();
+        assert!(s.growth.outcome.is_none());
+    }
+
+    #[test]
+    fn a_list_read_before_the_press_does_not_bring_the_button_back() {
+        let (mut s, _) = faked(&[
+            ("anomalies", Ok(ANOMALIES)),
+            ("alerts --json", Ok(ALERTS)),
+            ("alerts ack", Ok(r#"{"id":"0a1"}"#)),
+        ]);
+        s.tick_growth();
+        s.run_held_growth();
+        // A second look starts (its answers held), then the press lands first.
+        s.now = 100.0;
+        s.tick_growth();
+        let looks = std::mem::take(&mut *s.growth.held.as_ref().unwrap().lock().unwrap());
+        s.ack_alert("0a1");
+        s.run_held_growth();
+        for w in looks {
+            s.land_growth(w());
+        }
+        let list = &s.growth.alerts.as_ref().unwrap().0;
+        assert!(list.iter().find(|a| a.id == "0a1").unwrap().acknowledged());
+    }
+
+    struct Panics;
+
+    impl Spectra for Panics {
+        fn run(&self, _: &[String], _: Duration, _: &AtomicBool) -> Result<String, Failure> {
+            panic!("boom")
+        }
+    }
+
+    #[test]
+    fn a_call_that_panics_lands_a_failure_instead_of_checking_forever() {
+        let (mut s, _) = faked(&all_good());
+        s.growth.spectra = Arc::new(Panics);
+        s.tick_growth();
+        let quiet = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        s.run_held_growth();
+        std::panic::set_hook(quiet);
+        assert!(!s.growth.running(), "both calls landed");
+        assert_eq!(s.growth.jumps_note, Some(Note::Failed(INTERNAL.into())));
+        assert_eq!(s.growth.alerts_error.as_deref(), Some(INTERNAL));
     }
 }
