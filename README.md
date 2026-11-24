@@ -269,7 +269,7 @@ What it shows:
     share one node's state), off the UI thread with a deadline (45 s for health, 60 s for processes,
     120 s for JVMs) and an output cap. Leaving the page, hiding the window or quitting stops the call
     on its way. A failed reading keeps the last list and says why; a Mac that can't be reached says
-    so with what to check; an agent without `process.list` says it can't list processes yet; a Mac
+    so with what to check; an agent without `process.list` (or started without `--allow-processes`, which it needs to offer process and JVM lists) says it can't list processes yet; a Mac
     without `spectra-remote` gets a notice saying how to install it. Set `SPECTRA_REMOTE_BIN` if
     `spectra-remote` isn't on `PATH`.
 - **Compare**, under Storage: what's different from when it was fine. It lists the snapshots and

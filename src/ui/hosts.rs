@@ -317,7 +317,7 @@ pub fn host_page(s: &App, h: &HostState, k: &Kit) -> El {
             page = page.child(callout(
                 "host-unsupported",
                 "This Mac's agent can't list processes yet",
-                "Its Spectra Remote agent doesn't offer process.list. Update spectra-remote-agent on that Mac to a version that does; its health is shown above.",
+                "Its Spectra Remote agent doesn't offer process.list. On that Mac, run a spectra-remote-agent that has it and start it with --allow-processes (process lists show every command line, so the agent keeps them off unless asked); its health is shown above.",
                 k,
             ));
         }
