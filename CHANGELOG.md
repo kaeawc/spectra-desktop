@@ -7,6 +7,8 @@ Notable changes to Spectra Desktop. The format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-27
+
 ### Added
 
 - Releases: macOS binaries (Apple silicon and Intel) on GitHub Releases, built when a version bump
