@@ -1,5 +1,7 @@
 # spectra-desktop
 
+> **This repository has moved.** The desktop app now lives in [kaeawc/spectra](https://github.com/kaeawc/spectra) under [`desktop/`](https://github.com/kaeawc/spectra/tree/main/desktop), with this repository's full history. Its open issues moved there too, under the label `desktop`. This repository is archived; the [v0.1.0 release](https://github.com/kaeawc/spectra-desktop/releases/tag/v0.1.0) can still be downloaded here.
+
 <img src="assets/brand/spectra-icon.svg" alt="Spectra" width="128">
 
 A diagnosis-first desktop app for every process on this machine, built with
